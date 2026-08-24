@@ -1,5 +1,15 @@
 # Changelog
 
+## Upcoming
+
+### Fixed
+
+- Allow the default-on `rawfd` feature to build on Windows targets (previously
+  a hard `compile_error!` whenever `rawfd` and `target_family = "windows"`
+  were both active). The feature's actual (Unix-only) implementation is now
+  gated to `unix` instead, making it a no-op on Windows rather than a build
+  failure. No PR yet — tracked on the `windows-support` branch.
+
 ## 0.18.0
 
 ### Changed

@@ -5,12 +5,24 @@
 ### Added
 
 - [[#254](https://github.com/rust-vmm/vmm-sys-util/pull/254)]: Support `TFD_NONBLOCK` for `timerfd::TimerFd`.
+- Windows support for `eventfd::EventFd`, `epoll::Epoll`, and `event`
+  (`EventConsumer`/`EventNotifier`), gated to `cfg(target_family = "windows")`.
+  `EventFd` is backed by a named, manual-reset Win32 event and is signal-only
+  (no counter, unlike Linux eventfd); `Epoll` is backed by an I/O completion
+  port and supports only `EventSet::IN`. No PR yet — tracked on the
+  `windows-support` branch.
 
 ### Changed
 
 - [[#25](https://github.com/rust-vmm/vmm-sys-util/issues/25)]: Mark
   `linux::aio::IoContext::submit` as unsafe to reflect that callers must uphold
   the safety requirements for submitted buffers.
+
+### Fixed
+
+- Stop importing `libc`/`errno_result` unconditionally in `tempfile.rs`; they
+  are only used by the `cfg(unix)` `new_with_prefix` implementation and
+  produced unused-import warnings when building for Windows.
 
 ## v0.15.0
 
