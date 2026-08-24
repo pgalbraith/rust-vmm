@@ -17,6 +17,11 @@ mod unix;
 #[cfg(unix)]
 pub use crate::unix::*;
 
+#[cfg(target_family = "windows")]
+mod windows;
+#[cfg(target_family = "windows")]
+pub use crate::windows::*;
+
 pub mod align;
 pub mod errno;
 pub mod fam;
