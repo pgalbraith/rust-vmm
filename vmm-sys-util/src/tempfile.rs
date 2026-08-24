@@ -32,9 +32,12 @@ use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 use libc;
 
-use crate::errno::{errno_result, Error, Result};
+#[cfg(unix)]
+use crate::errno::errno_result;
+use crate::errno::{Error, Result};
 
 /// Wrapper for working with temporary files.
 ///
