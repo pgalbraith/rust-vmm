@@ -2,24 +2,17 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! A Windows analog of Linux [`epoll`](http://man7.org/linux/man-pages/man7/epoll.7.html),
-//! backed by an I/O completion port (IOCP) and per-handle threadpool waits.
+//! backed by an I/O completion port and one threadpool wait per handle.
 //!
-//! This is deliberately narrower than Linux epoll: it only supports waiting
-//! for a handle to become signaled ([`EventSet::IN`]). There is no Windows
-//! equivalent of `EPOLLOUT`/`EPOLLERR`/edge-triggering/one-shot for an
-//! arbitrary synchronization handle, and no rust-vmm consumer needs one —
-//! [`Epoll::ctl`] rejects any other bit with an error rather than silently
-//! ignoring it, so a caller that actually needs one of those semantics finds
-//! out immediately instead of getting silent no-op behavior.
+//! Only [`EventSet::IN`] is supported; [`Epoll::ctl`] rejects any other bit
+//! rather than silently ignoring it. [`Epoll::wait`] resets a handle's event
+//! as part of delivering its wake-up, so a consumer (e.g.
+//! [`crate::event::EventConsumer::consume`]) must not block on it again.
 //!
-//! Internally, each handle registered via [`ControlOperation::Add`] gets a
-//! threadpool wait ([`RegisterWaitForSingleObject`]) whose callback resets
-//! the handle (these are manual-reset events, so failing to reset would spin
-//! the callback) and posts a completion packet carrying the caller's `data`
-//! to the port. [`Epoll::wait`] drains completion packets via
-//! `GetQueuedCompletionStatus`.
-//!
-//! [`RegisterWaitForSingleObject`]: https://learn.microsoft.com/en-us/windows/win32/api/threadpoollegacyapiset/nf-threadpoollegacyapiset-registerwaitforsingleobject
+//! A registered handle must be removed with [`ControlOperation::Delete`] (or
+//! by dropping the `Epoll`) before it is closed — unlike Linux, closing the
+//! handle first does not implicitly unregister it, and leaves a dangling
+//! wait registration.
 
 use std::collections::HashMap;
 use std::io;
@@ -133,47 +126,31 @@ struct WaitCallbackCtx {
     iocp: HANDLE,
     handle: HANDLE,
     data: u64,
-    // The threadpool wait handle currently watching `handle`. Registered
-    // with `WT_EXECUTEONLYONCE`: rather than relying on
-    // `RegisterWaitForSingleObject`'s built-in persistent re-arm (which can
-    // race ahead of `wait_callback`'s `ResetEvent` and deliver a spurious
-    // duplicate for a single signal — the "spin" hazard manual-reset events
-    // have with this API), `wait_callback` re-registers explicitly *after*
-    // resetting the event, and publishes the new registration here.
+    // Current WT_EXECUTEONLYONCE registration for `handle`; re-armed by
+    // `wait_callback` after each fire (see its comment).
     wait_handle: AtomicPtr<c_void>,
 }
 
-// SAFETY: `WaitCallbackCtx` is only ever accessed through a raw pointer
-// handed to the Win32 threadpool, and only while the owning `Epoll`'s
-// registration for it is alive; `wait_handle` is the one field mutated
-// after construction, and it is only ever accessed through the atomic.
+// SAFETY: only ever invoked by the Win32 threadpool with the context pointer
+// this callback was registered with, which stays valid until unregistered.
 unsafe extern "system" fn wait_callback(param: *mut c_void, _timer_or_wait_fired: u8) {
-    // SAFETY: `param` was produced by `Box::into_raw` in `Epoll::add` (or by
-    // a previous invocation of this function) and remains valid until
-    // `Epoll::delete`/`Drop` unregisters and frees it.
+    // SAFETY: see the function's SAFETY comment.
     let ctx = unsafe { &*(param as *const WaitCallbackCtx) };
-    // Reset before doing anything else: this is a manual-reset event, and
-    // re-arming the wait (below) while it is still signaled would just
-    // trigger another immediate callback.
-    //
-    // SAFETY: `ctx.handle` is a valid, still-open event handle for as long
-    // as this registration is alive.
+
+    // Reset before re-arming below: a manual-reset event left signaled would
+    // just retrigger the callback immediately.
+    // SAFETY: `ctx.handle` is valid for as long as this registration is.
     unsafe {
         ResetEvent(ctx.handle);
     }
-    // SAFETY: `ctx.iocp` is a valid I/O completion port handle for as long
-    // as the owning `Epoll` (and therefore this registration) is alive.
+    // SAFETY: `ctx.iocp` is valid for as long as this registration is.
     unsafe {
         PostQueuedCompletionStatus(ctx.iocp, 0, ctx.data as usize, null_mut());
     }
-    // Re-arm for the next signal now that the event has been reset. This
-    // registration is a fresh `WT_EXECUTEONLYONCE` wait, not a re-use of the
-    // one that just fired.
-    //
-    // SAFETY: `ctx.handle` is valid as above; `param` is the same context
-    // pointer this callback itself was invoked with, so passing it again as
-    // the new registration's context is valid for the same reason.
+
+    // Re-arm with a fresh WT_EXECUTEONLYONCE wait now that the event is reset.
     let mut new_wait_handle: HANDLE = null_mut();
+    // SAFETY: `ctx.handle` is valid as above; `param` is this same context.
     let ret = unsafe {
         RegisterWaitForSingleObject(
             &mut new_wait_handle,
@@ -187,10 +164,8 @@ unsafe extern "system" fn wait_callback(param: *mut c_void, _timer_or_wait_fired
     if ret != 0 {
         ctx.wait_handle.store(new_wait_handle, Ordering::Release);
     }
-    // If re-registration fails there is nothing actionable to do from a
-    // callback; the handle simply stops being watched until the caller
-    // notices (e.g. via a `Delete`/re-`Add`) — an unexpected OS-level
-    // failure here, not a normal runtime condition.
+    // On failure the handle just stops being watched; nothing actionable
+    // from a callback.
 }
 
 /// Wrapper over epoll-like functionality, backed by an I/O completion port.
@@ -248,8 +223,9 @@ impl Epoll {
     /// # Arguments
     ///
     /// * `operation` - the action to perform.
-    /// * `handle` - the handle `operation` applies to. Must be a waitable
-    ///   kernel object handle (e.g. an [`EventFd`](crate::eventfd::EventFd)).
+    /// * `handle` - a waitable kernel object handle (e.g. an
+    ///   [`EventFd`](crate::eventfd::EventFd)); see the module docs for the
+    ///   handle-lifetime requirement.
     /// * `event` - the associated event; only [`EventSet::IN`] (or empty,
     ///   for [`ControlOperation::Delete`]) is accepted.
     pub fn ctl(
@@ -407,44 +383,89 @@ impl Drop for Epoll {
 }
 
 fn unregister(reg: Registration) -> io::Result<()> {
-    // `wait_callback` re-registers a fresh `WT_EXECUTEONLYONCE` wait after
-    // every fire, so the handle stored in `ctx.wait_handle` can change
-    // concurrently with this function. Loop: atomically claim whatever
-    // handle is current, unregister it (which — passing
-    // `INVALID_HANDLE_VALUE` — blocks until any in-flight callback for it
-    // has returned, including that callback's own re-registration, if it
-    // raced with us), and check again. This converges because a real fire
-    // only ever re-registers once per callback invocation; once no fire is
-    // racing with us, the field is left at null and the loop ends.
+    // `wait_callback` re-registers itself after every fire, so the current
+    // handle can change concurrently; loop, atomically claiming and
+    // unregistering whatever's current, until none remains. Each
+    // `UnregisterWaitEx` call blocks until any in-flight callback for that
+    // handle returns, so once the loop ends nothing can reference `reg.ctx`.
+    let mut result = Ok(());
     loop {
-        // SAFETY: `reg.ctx` is valid until we free it below, and
-        // `wait_handle` is never accessed except through this atomic.
+        // SAFETY: `reg.ctx` is valid until freed below.
         let handle = unsafe { (*reg.ctx).wait_handle.swap(null_mut(), Ordering::AcqRel) };
         if handle.is_null() {
             break;
         }
-        // SAFETY: `handle` was produced by a successful
-        // `RegisterWaitForSingleObject` call and was just atomically claimed
-        // above, so no concurrent caller can also be unregistering it.
+        // SAFETY: `handle` was just atomically claimed above.
         let ret = unsafe { UnregisterWaitEx(handle as HANDLE, INVALID_HANDLE_VALUE) };
         if ret == 0 {
-            return Err(io::Error::last_os_error());
+            // Keep the first error but keep looping: a racing callback may
+            // still have re-registered a handle that needs claiming.
+            result = result.and(Err(io::Error::last_os_error()));
         }
     }
-    // SAFETY: the loop above only exits once `wait_handle` is null with no
-    // callback left able to store a new value into it (any callback whose
-    // completion we waited on above has already returned), so nothing can
-    // reference `reg.ctx` any longer.
+    // SAFETY: see the loop comment above.
     unsafe {
         drop(Box::from_raw(reg.ctx));
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::EventConsumer;
     use crate::eventfd::EventFd;
+    use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+
+    #[test]
+    fn test_consume_after_epoll_wait_does_not_deadlock() {
+        // Regression test for the exact `vhost-user-backend` kick pattern:
+        // register a handle with `Epoll`, signal it, `Epoll::wait` for it
+        // (which resets the handle as part of delivery), then consume it
+        // through an `EventConsumer` built from the same handle, the way
+        // `vring.rs` builds one from a wire-delivered handle via
+        // `from_raw_handle`. This must not block: the whole point is that
+        // `Epoll::wait` having already reported the event as ready is
+        // sufficient, and `EventConsumer::consume` must not try to wait
+        // again on an event `Epoll` has already reset.
+        const TIMEOUT: i32 = 5000;
+
+        let epoll = Epoll::new().unwrap();
+        let event_fd = EventFd::new(0).unwrap();
+        let consumer_handle = event_fd.try_clone().unwrap().into_raw_handle();
+        // SAFETY: `consumer_handle` was just obtained from `into_raw_handle`
+        // and has not been closed.
+        let consumer = unsafe { EventConsumer::from_raw_handle(consumer_handle) };
+
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                event_fd.as_raw_handle(),
+                EpollEvent::new(EventSet::IN, 1),
+            )
+            .unwrap();
+
+        event_fd.write(1).unwrap();
+
+        let mut ready = [EpollEvent::default(); 8];
+        let count = epoll.wait(TIMEOUT, &mut ready[..]).unwrap();
+        assert_eq!(count, 1);
+
+        // The regression: this used to hang forever.
+        consumer.consume().unwrap();
+
+        // `RegisterWaitForSingleObject` requires the registered handle to
+        // stay open until explicitly unregistered (unlike Linux, where
+        // closing a fd implicitly drops it from any epoll interest list) —
+        // delete before `event_fd` drops (and closes its handle) below.
+        epoll
+            .ctl(
+                ControlOperation::Delete,
+                event_fd.as_raw_handle(),
+                EpollEvent::default(),
+            )
+            .unwrap();
+    }
 
     #[test]
     fn test_event_ops() {
@@ -570,5 +591,15 @@ mod tests {
         let count = epoll.wait(TIMEOUT, &mut ready[..]).unwrap();
         assert_eq!(count, 1);
         assert_eq!(ready[0].data(), 42);
+
+        // See the comment in `test_consume_after_epoll_wait_does_not_deadlock`:
+        // must delete before `event_fd` drops.
+        epoll
+            .ctl(
+                ControlOperation::Delete,
+                event_fd.as_raw_handle(),
+                EpollEvent::default(),
+            )
+            .unwrap();
     }
 }

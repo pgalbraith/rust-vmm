@@ -66,16 +66,21 @@ impl IntoRawHandle for EventNotifier {
 
 /// EventConsumer
 /// This is a generic event consumer, backed on Windows by a named event
-/// object. It allows waiting for and consuming a signaled event.
+/// object.
 #[derive(Debug)]
 pub struct EventConsumer {
     event: EventFd,
 }
 
 impl EventConsumer {
-    /// Wait for the event to be signaled, then reset it.
+    /// Consume a pending signal, if any.
+    ///
+    /// Unlike the Linux implementation, this does not block — see
+    /// [`crate::epoll::Epoll`]'s module docs for why (it resets the handle
+    /// itself when reporting it ready), so this is not usable as a
+    /// standalone "block until signaled" primitive on Windows.
     pub fn consume(&self) -> result::Result<(), io::Error> {
-        self.event.read().map(|_| ())
+        self.event.try_consume()
     }
 
     /// Clone this EventConsumer.
@@ -152,11 +157,16 @@ mod tests {
     }
 
     #[test]
-    fn test_nonblock() {
-        let (consumer, _notifier) = new_event_consumer_and_notifier(EventFlag::NONBLOCK)
+    fn test_consume_does_not_block_when_unsignaled() {
+        // Regression test: `Epoll::wait` resets the underlying event as
+        // part of delivering a wake-up, so `consume()` must tolerate
+        // (rather than hang on) an already-unsignaled event — this is the
+        // normal post-`Epoll::wait` case, not an error condition. The
+        // `EventFlag::NONBLOCK` flag has no bearing on this: `consume()`
+        // never blocks on Windows regardless.
+        let (consumer, _notifier) = new_event_consumer_and_notifier(EventFlag::empty())
             .expect("Failed to create notifier and consumer");
-        let err = consumer.consume().unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(consumer.consume().is_ok());
     }
 
     #[test]

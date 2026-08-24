@@ -4,18 +4,13 @@
 //! A Windows analog of Linux [`eventfd`](http://man7.org/linux/man-pages/man2/eventfd.2.html),
 //! backed by a manual-reset Win32 event object.
 //!
-//! Unlike Linux eventfd, a Win32 event carries no counter: it is either
-//! signaled or not. [`EventFd::write`] and [`EventFd::read`] therefore do
-//! **not** implement eventfd's add/drain counter semantics (no accumulation,
-//! no overflow blocking) — they only signal and wait. This is sufficient for
-//! doorbell/notification use (kick, call, wake-up), which is the only way
-//! this type is used across rust-vmm.
+//! Unlike Linux eventfd there is no counter: [`EventFd::write`]/[`EventFd::read`]
+//! only signal and wait, which is sufficient for doorbell use (kick, call,
+//! wake-up) — the only way this type is used across rust-vmm.
 //!
-//! An `EventFd` can be shared with another process by name: [`EventFd::new`]
-//! mints a process-unique name that a peer can open with [`EventFd::open`],
-//! provided the name is communicated out of band (e.g. over a control
-//! socket). The name itself carries no meaning to the peer beyond being a
-//! valid argument to `OpenEventA`.
+//! [`EventFd::new`] mints a process-unique name; a peer process can open the
+//! same event with [`EventFd::open`] if that name is passed to it out of
+//! band (e.g. over a control socket).
 
 use std::ffi::CString;
 use std::io;
@@ -139,22 +134,39 @@ impl EventFd {
     /// instead of blocking when the event is not currently signaled.
     pub fn read(&self) -> result::Result<u64, io::Error> {
         let timeout = if self.nonblock { 0 } else { INFINITE };
+        if self.wait_for_signal(timeout)? {
+            Ok(1)
+        } else {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+    }
+
+    /// Non-blocking check for a pending signal: resets it if signaled, and
+    /// returns `Ok(())` either way — never waits, unlike [`EventFd::read`],
+    /// and ignores [`EFD_NONBLOCK`]. Used by [`crate::event::EventConsumer`],
+    /// which may be called after [`crate::epoll::Epoll::wait`] has already
+    /// reset the handle.
+    pub(crate) fn try_consume(&self) -> result::Result<(), io::Error> {
+        self.wait_for_signal(0).map(|_| ())
+    }
+
+    /// Waits (for up to `timeout_ms`) for the event to become signaled, and
+    /// if it does, resets it. Returns `Ok(true)` if the event was observed
+    /// signaled (and has now been reset), `Ok(false)` on a timeout.
+    fn wait_for_signal(&self, timeout_ms: u32) -> result::Result<bool, io::Error> {
         // SAFETY: `self.event` is a valid handle for the lifetime of `self`.
-        let ret = unsafe { WaitForSingleObject(self.event, timeout) };
+        let ret = unsafe { WaitForSingleObject(self.event, timeout_ms) };
         if ret == WAIT_OBJECT_0 {
-            // Reset only after a successful wait: a signal racing this
-            // reset simply leaves the event (re-)signaled rather than being
-            // lost, since we have not yet observed that later signal.
-            //
-            // SAFETY: `self.event` is a valid handle for the lifetime of
-            // `self`.
+            // Reset only after the wait succeeds: a signal racing this
+            // reset just leaves the event signaled again, not lost.
+            // SAFETY: `self.event` is valid for the lifetime of `self`.
             let ret = unsafe { ResetEvent(self.event) };
             if ret == 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(1)
+            Ok(true)
         } else if ret == WAIT_TIMEOUT {
-            Err(io::Error::from(io::ErrorKind::WouldBlock))
+            Ok(false)
         } else if ret == WAIT_FAILED {
             Err(io::Error::last_os_error())
         } else {
