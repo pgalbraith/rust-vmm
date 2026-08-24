@@ -1466,11 +1466,11 @@ mod tests {
     use super::*;
     use std::alloc::Layout;
 
-    #[cfg(feature = "rawfd")]
+    #[cfg(all(feature = "rawfd", unix))]
     use std::fs::File;
     #[cfg(feature = "backend-bitmap")]
     use std::mem::size_of_val;
-    #[cfg(feature = "rawfd")]
+    #[cfg(all(feature = "rawfd", unix))]
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
@@ -1479,7 +1479,7 @@ mod tests {
     use matches::assert_matches;
     #[cfg(feature = "backend-bitmap")]
     use std::num::NonZeroUsize;
-    #[cfg(feature = "rawfd")]
+    #[cfg(all(feature = "rawfd", unix))]
     use vmm_sys_util::tempfile::TempFile;
 
     #[cfg(feature = "backend-bitmap")]
@@ -1973,17 +1973,16 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "rawfd")]
+    // `ReadVolatile`/`WriteVolatile` for `File` is only implemented for `unix`
+    // (it's built on `AsFd` + raw `read`/`write` syscalls); a Windows-native
+    // implementation (e.g. via `ReadFile`/`WriteFile`) doesn't exist yet.
+    #[cfg(all(feature = "rawfd", unix))]
     fn mem_read_and_write() {
         let mut backing = vec![0u8; 5];
         let a = VolatileSlice::from(backing.as_mut_slice());
         let s = a.as_volatile_slice();
         s.write_obj(!0u32, 1).unwrap();
-        let mut file = if cfg!(target_family = "unix") {
-            File::open(Path::new("/dev/zero")).unwrap()
-        } else {
-            File::open(Path::new("c:\\Windows\\system32\\ntoskrnl.exe")).unwrap()
-        };
+        let mut file = File::open(Path::new("/dev/zero")).unwrap();
 
         file.read_exact_volatile(&mut s.get_slice(1, size_of::<u32>()).unwrap())
             .unwrap();
