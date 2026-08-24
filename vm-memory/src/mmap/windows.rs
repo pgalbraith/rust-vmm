@@ -161,6 +161,56 @@ impl<B: NewBitmap> MmapRegion<B> {
             file_offset: Some(file_offset),
         })
     }
+
+    /// Creates a mapping of `size` bytes over an existing section object.
+    ///
+    /// The counterpart of [`from_file`](Self::from_file) for a handle that *already is* a section
+    /// (a file mapping object) rather than a file to create one from. `from_file` cannot serve
+    /// here: it calls `CreateFileMappingA`, which requires a file handle and fails with
+    /// `ERROR_INVALID_HANDLE` when handed a section.
+    ///
+    /// The distinction matters wherever memory is shared between processes with no file involved
+    /// and no way to pass a handle directly — which is exactly the position the vhost-user
+    /// transport is in on Windows, where guest memory arrives as the *name* of a pagefile-backed
+    /// section and is opened with `OpenFileMappingA`.
+    ///
+    /// # Arguments
+    /// * `section` - An open section object. Ownership stays with the caller; the mapping remains
+    ///   valid even after that handle is closed, because Windows keeps a section alive while any
+    ///   view of it exists.
+    /// * `offset` - Offset within the section at which the mapping starts. Must be a multiple of
+    ///   the system allocation granularity.
+    /// * `size` - The size of the memory region in bytes.
+    pub fn from_section(section: &impl AsRawHandle, offset: u64, size: usize) -> io::Result<Self> {
+        let handle = section.as_raw_handle();
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+
+        // Mapped directly: unlike `from_file` there is no intermediate object to create, because
+        // the section already is one.
+        let addr = unsafe {
+            MapViewOfFile(
+                handle,
+                FILE_MAP_ALL_ACCESS,
+                (offset >> 32) as u32,
+                offset as u32,
+                size,
+            )
+        };
+        if addr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self {
+            addr: addr as *mut u8,
+            size,
+            bitmap: B::with_len(size),
+            // Deliberately `None`: the region is not backed by a file, and reporting a fabricated
+            // `FileOffset` would suggest a caller could re-derive the mapping from one.
+            file_offset: None,
+        })
+    }
 }
 
 impl<B: Bitmap> MmapRegion<B> {
