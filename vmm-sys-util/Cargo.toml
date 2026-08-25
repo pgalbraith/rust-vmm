@@ -22,9 +22,8 @@ serde = { version = "1.0.27", optional = true }
 serde_derive = { version = "1.0.27", optional = true }
 bitflags = "2.13"
 
-# `Win32_Security` looks out of place but is required: `CreateEventA` is gated on it
-# because its first parameter is a `*const SECURITY_ATTRIBUTES`. `SYNCHRONIZE` lives
-# under `Win32_Storage_FileSystem` (generic access rights are grouped there).
+# Win32_Security is required for CreateEventA's *const SECURITY_ATTRIBUTES param.
+# SYNCHRONIZE lives under Win32_Storage_FileSystem.
 [target.'cfg(target_family = "windows")'.dependencies.windows-sys]
 version = "0.61"
 features = [

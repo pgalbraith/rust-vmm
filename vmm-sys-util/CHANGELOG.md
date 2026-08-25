@@ -6,29 +6,18 @@
 
 - [[#254](https://github.com/rust-vmm/vmm-sys-util/pull/254)]: Support `TFD_NONBLOCK` for `timerfd::TimerFd`.
 - Windows support for `eventfd::EventFd`, `epoll::Epoll`, and `event`
-  (`EventConsumer`/`EventNotifier`), gated to `cfg(target_family = "windows")`.
-  `EventFd` is backed by a named, manual-reset Win32 event and is signal-only
-  (no counter, unlike Linux eventfd); `Epoll` is backed by an I/O completion
-  port and supports only `EventSet::IN`. Bound through `windows-sys` (the
-  maintained, Microsoft-generated bindings) rather than `winapi`. No PR yet —
-  tracked on the `windows-support` branch.
-- Windows `section::Section`: a named, pagefile-backed section object — the
-  create/name/open half of cross-process shared memory, complementing
-  `vm-memory`'s `MmapRegion::from_section` mapping half.
+  (`EventConsumer`/`EventNotifier`), bound through `windows-sys`.
+- Windows `section::Section`: a named, pagefile-backed section object,
+  complementing `vm-memory`'s `MmapRegion::from_section`.
 - Windows `EventFd::new_shareable()`: creates the event under a retained,
   process-unique name (`EventFd::name()`) for handing to a peer. Plain
-  `EventFd::new()` is anonymous again — a Win32 object can only be named at
-  creation, and most events never cross a process boundary, so naming them
-  all only polluted the session's object namespace.
+  `EventFd::new()` is anonymous again.
 
 ### Fixed
 
-- Windows `Epoll` leaked one threadpool wait handle per delivered event:
-  the callback re-armed by registering a fresh wait and abandoned the
-  spent one, which only `UnregisterWaitEx` can free. Re-arming (and
-  reaping) now happens in `Epoll::wait` when the completion is consumed.
-  Found live as the virtiofsd daemon leaking one handle per FUSE request;
-  leak-cycle tests now pin handle-count deltas across the Windows modules.
+- Windows `Epoll` leaked one threadpool wait handle per delivered event.
+  Re-arming and reaping the spent registration now happens in
+  `Epoll::wait` instead of the callback.
 
 ### Changed
 
@@ -38,9 +27,8 @@
 
 ### Fixed
 
-- Stop importing `libc`/`errno_result` unconditionally in `tempfile.rs`; they
-  are only used by the `cfg(unix)` `new_with_prefix` implementation and
-  produced unused-import warnings when building for Windows.
+- Stop importing `libc`/`errno_result` unconditionally in `tempfile.rs`,
+  which produced unused-import warnings when building for Windows.
 
 ## v0.15.0
 

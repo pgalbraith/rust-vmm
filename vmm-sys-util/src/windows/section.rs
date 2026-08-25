@@ -4,15 +4,13 @@
 //! A named, pagefile-backed section object (file mapping), the Windows
 //! rendezvous for sharing memory between unrelated processes.
 //!
-//! Windows has no `SCM_RIGHTS`-style descriptor passing; the native
-//! mechanism is the kernel object namespace. One process creates the
+//! Windows has no `SCM_RIGHTS`-style descriptor passing, so the native
+//! mechanism is the kernel object namespace: one process creates the
 //! section under a generated name with [`Section::new`], transmits the
-//! name out of band (e.g. over a control socket, as the vhost-user
-//! Windows transport does), and the peer opens the same memory with
-//! [`Section::open`]. Mapping a view of the section is `vm-memory`'s
-//! job (`MmapRegion::from_section`); this type is only the object's
-//! creation, naming, and handle ownership — the complement of that
-//! mapping half.
+//! name out of band, and the peer opens the same memory with
+//! [`Section::open`]. Mapping a view is `vm-memory`'s job
+//! (`MmapRegion::from_section`); this type only handles creation,
+//! naming, and handle ownership.
 
 use std::ffi::CString;
 use std::io;

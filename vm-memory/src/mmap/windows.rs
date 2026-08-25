@@ -77,9 +77,8 @@ pub struct MmapRegion<B> {
     size: usize,
     bitmap: B,
     file_offset: Option<FileOffset>,
-    /// Whether `addr` is a view mapped with `MapViewOfFile` (from a file or a section) rather
-    /// than memory from `VirtualAlloc`. The two have disjoint release functions, and calling
-    /// the wrong one fails with `ERROR_INVALID_PARAMETER` and leaks the mapping.
+    /// Whether `addr` came from `MapViewOfFile` (file/section) rather than `VirtualAlloc`.
+    /// The two need different release functions; calling the wrong one leaks the mapping.
     mapped_view: bool,
 }
 
@@ -172,20 +171,16 @@ impl<B: NewBitmap> MmapRegion<B> {
 
     /// Creates a mapping of `size` bytes over an existing section object.
     ///
-    /// The counterpart of [`from_file`](Self::from_file) for a handle that *already is* a section
-    /// (a file mapping object) rather than a file to create one from. `from_file` cannot serve
-    /// here: it calls `CreateFileMappingA`, which requires a file handle and fails with
-    /// `ERROR_INVALID_HANDLE` when handed a section.
-    ///
-    /// The distinction matters wherever memory is shared between processes with no file involved
-    /// and no way to pass a handle directly — which is exactly the position the vhost-user
-    /// transport is in on Windows, where guest memory arrives as the *name* of a pagefile-backed
-    /// section and is opened with `OpenFileMappingA`.
+    /// Counterpart to [`from_file`](Self::from_file) for a handle that's already a section rather
+    /// than a file to create one from — `from_file` calls `CreateFileMappingA`, which fails with
+    /// `ERROR_INVALID_HANDLE` on a section handle. Needed when memory is shared between processes
+    /// with no file involved, e.g. the Windows vhost-user transport, where guest memory arrives as
+    /// the name of a pagefile-backed section, opened with `OpenFileMappingA`.
     ///
     /// # Arguments
     /// * `section` - An open section object. Ownership stays with the caller; the mapping remains
-    ///   valid even after that handle is closed, because Windows keeps a section alive while any
-    ///   view of it exists.
+    ///   valid after that handle is closed, since Windows keeps a section alive while any view of
+    ///   it exists.
     /// * `offset` - Offset within the section at which the mapping starts. Must be a multiple of
     ///   the system allocation granularity.
     /// * `size` - The size of the memory region in bytes.
@@ -195,8 +190,7 @@ impl<B: NewBitmap> MmapRegion<B> {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
 
-        // Mapped directly: unlike `from_file` there is no intermediate object to create, because
-        // the section already is one.
+        // The section already is the mapping object, so unlike `from_file` there's nothing to create.
         let addr = unsafe {
             MapViewOfFile(
                 handle,
@@ -214,8 +208,7 @@ impl<B: NewBitmap> MmapRegion<B> {
             addr: addr as *mut u8,
             size,
             bitmap: B::with_len(size),
-            // Deliberately `None`: the region is not backed by a file, and reporting a fabricated
-            // `FileOffset` would suggest a caller could re-derive the mapping from one.
+            // Deliberately `None`: not file-backed, so a fabricated `FileOffset` would mislead.
             file_offset: None,
             mapped_view: true,
         })
@@ -280,12 +273,9 @@ impl<B: Bitmap> VolatileMemory for MmapRegion<B> {
 
 impl<B> Drop for MmapRegion<B> {
     fn drop(&mut self) {
-        // This is safe because we mapped the area at addr ourselves, and nobody
-        // else is holding a reference to it.
-        // A view from MapViewOfFile must be released with UnmapViewOfFile;
-        // VirtualAlloc'd memory must be released with VirtualFree (with size 0
-        // when using MEM_RELEASE, otherwise the function fails). Each fails
-        // with ERROR_INVALID_PARAMETER on the other's memory, leaking it.
+        // Safe: we mapped `addr` ourselves and nobody else holds a reference.
+        // A MapViewOfFile view needs UnmapViewOfFile; VirtualAlloc'd memory needs VirtualFree
+        // (size 0 for MEM_RELEASE). Each fails with ERROR_INVALID_PARAMETER on the other's memory.
         unsafe {
             let ret_val = if self.mapped_view {
                 UnmapViewOfFile(self.addr as *const libc::c_void)
@@ -334,18 +324,13 @@ mod tests {
         crate::bitmap::tests::test_volatile_memory(&m);
     }
 
-    // A view mapped with MapViewOfFile must be released with UnmapViewOfFile; VirtualFree
-    // fails on it with ERROR_INVALID_PARAMETER and the view stays mapped. The three tests
-    // below pin the release path of each constructor by asking the OS, after the drop,
-    // whether the original allocation still sits at that address.
+    // Pins each constructor's release path by checking, after drop, whether the original
+    // allocation still sits at that address.
     //
-    // The check retries with a fresh region because a single attempt is racy: tests run in
-    // parallel, Windows hands out the lowest free address, and so another thread's mapping
-    // can land exactly at the just-freed base between the drop and the query, looking
-    // identical to a leak (measured at roughly 1 in 20 runs for the file-backed test, by
-    // looping two copies of this test binary concurrently). The two outcomes separate
-    // cleanly under retry: a broken release leaks the original allocation *every* time,
-    // while a reuse collision has to recur independently per attempt.
+    // Retries with a fresh region since one attempt is racy under parallel test runs: Windows
+    // reuses the lowest free address, so another thread's mapping can land at the just-freed
+    // base and look identical to a leak. A broken release leaks every attempt; a reuse
+    // collision doesn't recur.
 
     use libc::{c_void, size_t};
 
@@ -500,10 +485,8 @@ mod tests {
 
     #[test]
     fn a_thousand_mapping_cycles_leak_no_views() {
-        // The test the UnmapViewOfFile release bug deserved from the
-        // start: a view leaked per drop shows up here as +N mapped
-        // regions. Delta over N rather than exact equality, because
-        // other test threads map and unmap concurrently.
+        // A view leaked per drop shows up as +N mapped regions. Delta over N, not
+        // exact equality: other test threads map and unmap concurrently.
         const N: usize = 1000;
         let section = unsafe {
             super::CreateFileMappingA(

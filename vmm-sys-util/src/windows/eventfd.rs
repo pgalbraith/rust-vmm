@@ -1,21 +1,17 @@
 // Copyright 2026 rust-vmm Authors or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! A Windows analog of Linux [`eventfd`](http://man7.org/linux/man-pages/man2/eventfd.2.html),
+//! Windows analog of Linux [`eventfd`](http://man7.org/linux/man-pages/man2/eventfd.2.html),
 //! backed by a manual-reset Win32 event object.
 //!
-//! Unlike Linux eventfd there is no counter: [`EventFd::write`]/[`EventFd::read`]
-//! only signal and wait, which is sufficient for doorbell use (kick, call,
-//! wake-up) — the only way this type is used across rust-vmm.
+//! A Win32 event has no counter, just signaled/not. [`EventFd::write`] and
+//! [`EventFd::read`] only signal and wait — no add/drain semantics. That's
+//! enough for doorbell use, the only way eventfd is used in rust-vmm.
 //!
-//! [`EventFd::new`] creates an anonymous event. An event meant for another
-//! process is created with [`EventFd::new_shareable`] instead, which mints a
-//! process-unique name the peer can [`open`](EventFd::open) once it is passed
-//! out of band (e.g. over a control socket). The split exists because a Win32
-//! object's name can only be given at creation — there is no naming an event
-//! after the fact — and most events (wakeups, internal doorbells) never cross
-//! a process boundary, so naming them all would only pollute the session's
-//! object namespace.
+//! [`EventFd::new`] creates an anonymous event. [`EventFd::new_shareable`]
+//! mints a process-unique name instead, for a peer to open via
+//! [`EventFd::open`] once it's passed out of band — a Win32 object can only
+//! be named at creation, and most events never cross a process boundary.
 
 use std::ffi::CString;
 use std::io;
@@ -35,22 +31,20 @@ use windows_sys::Win32::System::Threading::{
     EVENT_MODIFY_STATE, INFINITE,
 };
 
-// Reexported so callers can write `#[cfg]`-free code across platforms; only
-// `EFD_NONBLOCK` has any effect here. `EFD_SEMAPHORE` and `EFD_CLOEXEC` have
-// no Win32 equivalent and are silently ignored.
-/// Flag mirroring Linux's `EFD_NONBLOCK`, honored by [`EventFd`].
+// Reexported for #[cfg]-free callers. Only EFD_NONBLOCK has any effect;
+// EFD_SEMAPHORE/EFD_CLOEXEC have no Win32 equivalent and are ignored.
+/// Mirrors Linux's `EFD_NONBLOCK`, honored by [`EventFd`].
 pub const EFD_NONBLOCK: i32 = 1 << 0;
-/// Flag mirroring Linux's `EFD_CLOEXEC`; has no effect on Windows.
+/// Mirrors Linux's `EFD_CLOEXEC`; no effect on Windows.
 pub const EFD_CLOEXEC: i32 = 1 << 1;
-/// Flag mirroring Linux's `EFD_SEMAPHORE`; has no effect on Windows (there is
-/// no counter to decrement one unit at a time).
+/// Mirrors Linux's `EFD_SEMAPHORE`; no effect on Windows (no counter).
 pub const EFD_SEMAPHORE: i32 = 1 << 2;
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(0);
 
 fn unique_name() -> CString {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: the formatted string contains no interior NUL byte.
+    // SAFETY: formatted string has no interior NUL.
     CString::new(format!("vmm-sys-util-evt-{}-{}", process::id(), id)).unwrap()
 }
 
@@ -65,13 +59,10 @@ pub struct EventFd {
     name: Option<CString>,
 }
 
-// SAFETY: a Win32 HANDLE has no thread affinity; it is safe to use from any
-// thread as long as accesses are synchronized, which the Win32 API itself
-// guarantees for the operations this type performs.
+// SAFETY: a Win32 HANDLE has no thread affinity.
 unsafe impl Send for EventFd {}
-// SAFETY: all methods either take `&self` and only call thread-safe Win32
-// APIs (`SetEvent`/`WaitForSingleObject`/`ResetEvent`), or require exclusive
-// access via Rust's own borrow checking.
+// SAFETY: `&self` methods only call thread-safe Win32 APIs
+// (SetEvent/WaitForSingleObject/ResetEvent).
 unsafe impl Sync for EventFd {}
 
 impl EventFd {
@@ -103,9 +94,7 @@ impl EventFd {
     /// * `flag`: only [`EFD_NONBLOCK`] has any effect; see the module docs.
     pub fn new_shareable(flag: i32) -> result::Result<EventFd, io::Error> {
         let name = unique_name();
-        // SAFETY: `name` is a valid, NUL-terminated C string that outlives
-        // the call; all other arguments are simple values. We check the
-        // return value for failure.
+        // SAFETY: `name` is a valid NUL-terminated C string outliving the call.
         let handle = unsafe { CreateEventA(null(), 1, 0, name.as_ptr().cast()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
@@ -138,8 +127,7 @@ impl EventFd {
     ///   interior NUL byte.
     pub fn open(name: &str) -> result::Result<EventFd, io::Error> {
         let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        // SAFETY: `name` is a valid, NUL-terminated C string that outlives
-        // the call. We check the return value for failure.
+        // SAFETY: `name` is a valid NUL-terminated C string outliving the call.
         let handle =
             unsafe { OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, 0, name.as_ptr().cast()) };
         if handle.is_null() {
@@ -163,7 +151,7 @@ impl EventFd {
     /// * `v`: ignored; accepted only for source compatibility with the
     ///   Linux `EventFd::write` signature.
     pub fn write(&self, _v: u64) -> result::Result<(), io::Error> {
-        // SAFETY: `self.event` is a valid handle for the lifetime of `self`.
+        // SAFETY: `self.event` is valid for the lifetime of `self`.
         let ret = unsafe { SetEvent(self.event) };
         if ret == 0 {
             return Err(io::Error::last_os_error());
@@ -187,19 +175,18 @@ impl EventFd {
     }
 
     /// Non-blocking check for a pending signal: resets it if signaled, and
-    /// returns `Ok(())` either way — never waits, unlike [`EventFd::read`],
-    /// and ignores [`EFD_NONBLOCK`]. Used by [`crate::event::EventConsumer`],
-    /// which may be called after [`crate::epoll::Epoll::wait`] has already
-    /// reset the handle.
+    /// returns `Ok(())` either way — never waits, unlike [`EventFd::read`].
+    /// Used by [`crate::event::EventConsumer`], which may run after
+    /// [`crate::epoll::Epoll::wait`] has already reset the handle.
     pub(crate) fn try_consume(&self) -> result::Result<(), io::Error> {
         self.wait_for_signal(0).map(|_| ())
     }
 
-    /// Waits (for up to `timeout_ms`) for the event to become signaled, and
-    /// if it does, resets it. Returns `Ok(true)` if the event was observed
-    /// signaled (and has now been reset), `Ok(false)` on a timeout.
+    /// Waits up to `timeout_ms` for the event to become signaled, resetting
+    /// it if so. Returns `Ok(true)` if signaled (and reset), `Ok(false)` on
+    /// timeout.
     fn wait_for_signal(&self, timeout_ms: u32) -> result::Result<bool, io::Error> {
-        // SAFETY: `self.event` is a valid handle for the lifetime of `self`.
+        // SAFETY: `self.event` is valid for the lifetime of `self`.
         let ret = unsafe { WaitForSingleObject(self.event, timeout_ms) };
         if ret == WAIT_OBJECT_0 {
             // Reset only after the wait succeeds: a signal racing this
@@ -227,9 +214,8 @@ impl EventFd {
     /// object.
     pub fn try_clone(&self) -> result::Result<EventFd, io::Error> {
         let mut new_handle: HANDLE = null_mut();
-        // SAFETY: `GetCurrentProcess` returns a pseudo-handle valid for the
-        // lifetime of the process; `self.event` is a valid handle for the
-        // lifetime of `self`; `new_handle` is a valid out-pointer.
+        // SAFETY: `GetCurrentProcess` is a pseudo-handle valid for the
+        // process lifetime; `self.event` is valid for `self`'s lifetime.
         let ret = unsafe {
             let process = GetCurrentProcess();
             DuplicateHandle(
@@ -281,7 +267,7 @@ impl IntoRawHandle for EventFd {
 
 impl Drop for EventFd {
     fn drop(&mut self) {
-        // SAFETY: `self.event` is a valid handle owned by this `EventFd`.
+        // SAFETY: `self.event` is owned by this `EventFd`.
         unsafe {
             CloseHandle(self.event);
         }

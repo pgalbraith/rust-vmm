@@ -12,8 +12,7 @@ use crate::eventfd::EventFd;
 pub use crate::eventfd::{EFD_CLOEXEC, EFD_NONBLOCK, EFD_SEMAPHORE};
 
 bitflags::bitflags! {
-    /// EventFlag
-    /// This enum is used to define flags for the event notifier and consumer.
+    /// Flags for the event notifier and consumer.
     pub struct EventFlag: u8 {
         /// Non-blocking flag
         const NONBLOCK = 1 << 0;
@@ -22,9 +21,7 @@ bitflags::bitflags! {
     }
 }
 
-/// EventNotifier
-/// This is a generic event notifier, backed on Windows by a named event
-/// object. It allows signaling an event to notify a peer.
+/// Signals an event to notify a peer, backed on Windows by a named event object.
 #[derive(Debug)]
 pub struct EventNotifier {
     event: EventFd,
@@ -64,9 +61,7 @@ impl IntoRawHandle for EventNotifier {
     }
 }
 
-/// EventConsumer
-/// This is a generic event consumer, backed on Windows by a named event
-/// object.
+/// Consumes a signaled event, backed on Windows by a named event object.
 #[derive(Debug)]
 pub struct EventConsumer {
     event: EventFd,
@@ -75,9 +70,8 @@ pub struct EventConsumer {
 impl EventConsumer {
     /// Consume a pending signal, if any.
     ///
-    /// Unlike the Linux implementation, this does not block — see
-    /// [`crate::epoll::Epoll`]'s module docs for why (it resets the handle
-    /// itself when reporting it ready), so this is not usable as a
+    /// Unlike Linux, this does not block: [`crate::epoll::Epoll`] resets the
+    /// handle itself when reporting it ready, so this isn't usable as a
     /// standalone "block until signaled" primitive on Windows.
     pub fn consume(&self) -> result::Result<(), io::Error> {
         self.event.try_consume()
@@ -158,12 +152,8 @@ mod tests {
 
     #[test]
     fn test_consume_does_not_block_when_unsignaled() {
-        // Regression test: `Epoll::wait` resets the underlying event as
-        // part of delivering a wake-up, so `consume()` must tolerate
-        // (rather than hang on) an already-unsignaled event — this is the
-        // normal post-`Epoll::wait` case, not an error condition. The
-        // `EventFlag::NONBLOCK` flag has no bearing on this: `consume()`
-        // never blocks on Windows regardless.
+        // consume() must tolerate an already-unsignaled event (the normal
+        // post-Epoll::wait case), regardless of EventFlag::NONBLOCK.
         let (consumer, _notifier) = new_event_consumer_and_notifier(EventFlag::empty())
             .expect("Failed to create notifier and consumer");
         assert!(consumer.consume().is_ok());
@@ -174,8 +164,7 @@ mod tests {
         let (consumer, notifier) = new_event_consumer_and_notifier(EventFlag::empty())
             .expect("Failed to create notifier and consumer");
         let handle = notifier.into_raw_handle();
-        // SAFETY: handle was just obtained from `into_raw_handle` above and
-        // has not been closed.
+        // SAFETY: handle came from `into_raw_handle` above and is not closed.
         let notifier = unsafe { EventNotifier::from_raw_handle(handle) };
         notifier.notify().unwrap();
         assert!(consumer.consume().is_ok());

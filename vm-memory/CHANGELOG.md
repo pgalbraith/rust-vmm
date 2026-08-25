@@ -4,17 +4,12 @@
 
 ### Changed
 
-- Windows bindings now come from `windows-sys` (the maintained,
-  Microsoft-generated crate) instead of `winapi`. No functional change; the
-  hand-declared `extern` block in `mmap/windows.rs` is unaffected.
+- Windows bindings now come from `windows-sys` instead of `winapi`.
 
 ### Fixed
 
-- Allow the default-on `rawfd` feature to build on Windows targets (previously
-  a hard `compile_error!` whenever `rawfd` and `target_family = "windows"`
-  were both active). The feature's actual (Unix-only) implementation is now
-  gated to `unix` instead, making it a no-op on Windows rather than a build
-  failure. No PR yet — tracked on the `windows-support` branch.
+- Allow the default-on `rawfd` feature to build on Windows targets; its
+  Unix-only implementation is now gated to `unix` instead of erroring out.
 
 ## 0.18.0
 

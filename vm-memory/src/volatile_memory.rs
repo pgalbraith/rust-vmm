@@ -1973,9 +1973,7 @@ mod tests {
     }
 
     #[test]
-    // `ReadVolatile`/`WriteVolatile` for `File` is only implemented for `unix`
-    // (it's built on `AsFd` + raw `read`/`write` syscalls); a Windows-native
-    // implementation (e.g. via `ReadFile`/`WriteFile`) doesn't exist yet.
+    // ReadVolatile/WriteVolatile for File is unix-only; no Windows impl yet.
     #[cfg(all(feature = "rawfd", unix))]
     fn mem_read_and_write() {
         let mut backing = vec![0u8; 5];

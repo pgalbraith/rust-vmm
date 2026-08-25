@@ -1,7 +1,7 @@
 // Copyright 2026 rust-vmm Authors or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! A Windows analog of Linux [`epoll`](http://man7.org/linux/man-pages/man7/epoll.7.html),
+//! Windows analog of Linux [`epoll`](http://man7.org/linux/man-pages/man7/epoll.7.html),
 //! backed by an I/O completion port and one threadpool wait per handle.
 //!
 //! Only [`EventSet::IN`] is supported; [`Epoll::ctl`] rejects any other bit
@@ -10,9 +10,8 @@
 //! [`crate::event::EventConsumer::consume`]) must not block on it again.
 //!
 //! A registered handle must be removed with [`ControlOperation::Delete`] (or
-//! by dropping the `Epoll`) before it is closed — unlike Linux, closing the
-//! handle first does not implicitly unregister it, and leaves a dangling
-//! wait registration.
+//! by dropping the `Epoll`) before it's closed — unlike Linux, closing first
+//! doesn't implicitly unregister it and leaves a dangling wait registration.
 
 use std::collections::HashMap;
 use std::io;
@@ -79,10 +78,8 @@ pub enum ControlOperation {
 /// Wrapper over the event data delivered by [`Epoll::wait`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EpollEvent {
-    /// Raw `EventSet` bits. Public (rather than accessed through a Deref
-    /// target, as on the Linux implementation) since there is no underlying
-    /// C struct to deref to; call sites that read `event.events` work
-    /// unchanged.
+    /// Raw `EventSet` bits. Public since there's no underlying C struct to
+    /// deref to, unlike the Linux implementation.
     pub events: u32,
     data: u64,
 }
@@ -134,15 +131,11 @@ struct WaitCallbackCtx {
 // this callback was registered with, which stays valid until unregistered.
 //
 // Deliberately does NOT re-arm the wait: a spent WT_EXECUTEONLYONCE
-// registration still holds a wait handle that only UnregisterWaitEx can
-// free, and a callback cannot safely unregister itself with the blocking
-// form. Re-arming (and reaping the spent registration) happens in
-// [`Epoll::wait`] when the completion is consumed -- a callback that
-// re-registered and abandoned its spent handle leaked one handle per
-// delivered event, found live as a daemon leaking one handle per FUSE
-// request. The completion key is the context pointer, so `wait` can find
-// the registration to re-arm (and skip completions whose registration was
-// deleted before they were consumed).
+// registration holds a wait handle only `UnregisterWaitEx` can free, and a
+// callback can't safely unregister itself with the blocking form.
+// [`Epoll::wait`] re-arms and reaps the spent registration when it consumes
+// the completion, keyed by this context pointer (also letting it skip
+// completions whose registration was deleted first).
 unsafe extern "system" fn wait_callback(param: *mut c_void, _timer_or_wait_fired: bool) {
     // SAFETY: see the function's SAFETY comment.
     let ctx = unsafe { &*(param as *const WaitCallbackCtx) };
@@ -196,8 +189,7 @@ impl Epoll {
     /// port.
     pub fn new() -> io::Result<Self> {
         // SAFETY: `INVALID_HANDLE_VALUE`/null are the documented arguments
-        // for creating a new, unassociated completion port. The return
-        // value is checked for failure.
+        // for creating a new, unassociated completion port.
         let iocp = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, null_mut(), 0, 0) };
         if iocp.is_null() {
             return Err(io::Error::last_os_error());
@@ -217,8 +209,8 @@ impl Epoll {
     /// * `handle` - a waitable kernel object handle (e.g. an
     ///   [`EventFd`](crate::eventfd::EventFd)); see the module docs for the
     ///   handle-lifetime requirement.
-    /// * `event` - the associated event; only [`EventSet::IN`] (or empty,
-    ///   for [`ControlOperation::Delete`]) is accepted.
+    /// * `event` - only [`EventSet::IN`] (or empty, for
+    ///   [`ControlOperation::Delete`]) is accepted.
     pub fn ctl(
         &self,
         operation: ControlOperation,
@@ -251,11 +243,10 @@ impl Epoll {
         }));
 
         let mut wait_handle: HANDLE = null_mut();
-        // SAFETY: `handle` is a caller-provided, valid waitable kernel
-        // object handle that outlives this registration (the caller's
-        // responsibility, same as `epoll_ctl` on Linux); `ctx` was just
-        // allocated and is freed only after `unregister` confirms no
-        // callback can observe it again.
+        // SAFETY: `handle` is a caller-provided, valid waitable handle that
+        // outlives this registration (the caller's responsibility, same as
+        // `epoll_ctl` on Linux); `ctx` is freed only after `unregister`
+        // confirms no callback can observe it again.
         let ret = unsafe {
             RegisterWaitForSingleObject(
                 &mut wait_handle,
@@ -274,8 +265,7 @@ impl Epoll {
             }
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: `ctx` is freshly allocated above and not yet reachable
-        // from any callback until the store below completes.
+        // SAFETY: `ctx` isn't reachable from any callback until this store.
         unsafe {
             (*ctx).wait_handle.store(wait_handle, Ordering::Release);
         }
@@ -329,9 +319,8 @@ impl Epoll {
             if ret == 0 {
                 let err = io::Error::last_os_error();
                 if count > 0 {
-                    // The blocking wait already found at least one event;
-                    // treat a non-blocking follow-up miss as "no more ready
-                    // right now" rather than an error.
+                    // Already found an event; treat a non-blocking
+                    // follow-up miss as "nothing more ready" not an error.
                     break;
                 }
                 if err.raw_os_error() == Some(WAIT_TIMEOUT as i32) {
@@ -340,10 +329,8 @@ impl Epoll {
                 return Err(err);
             }
 
-            // The key is the registration's context pointer (see
-            // wait_callback). Find it among the live registrations: a miss
-            // means the registration was deleted after the completion was
-            // queued, and a deleted handle must not be reported.
+            // The key is the registration's context pointer (see wait_callback). A miss means
+            // the registration was deleted after the completion was queued; don't report it.
             let registrations = self.registrations.lock().unwrap();
             let Some(reg) = registrations
                 .values()
@@ -357,9 +344,8 @@ impl Epoll {
             let ctx = unsafe { &*reg.ctx };
             let data = ctx.data;
 
-            // Reap the spent wait registration and re-arm. Safe to block
-            // here: this is not a callback thread, and the callback that
-            // posted this completion finished before posting it.
+            // Reap the spent registration and re-arm. Safe to block here: this isn't a
+            // callback thread, and the callback that posted this completion has returned.
             let spent = ctx.wait_handle.swap(null_mut(), Ordering::AcqRel);
             if !spent.is_null() {
                 // SAFETY: `spent` was atomically claimed above.
@@ -383,15 +369,14 @@ impl Epoll {
             if ret != 0 {
                 ctx.wait_handle.store(new_wait_handle, Ordering::Release);
             }
-            // On failure the handle stops being watched; the event itself
-            // is still delivered below.
+            // On failure the handle stops being watched; still deliver the event below.
             drop(registrations);
 
             events[count] = EpollEvent::new(EventSet::IN, data);
             count += 1;
-            // Only the first call should block; further calls just drain
-            // whatever is already queued, mirroring epoll_wait's ability to
-            // return several ready fds from one call.
+            // Only the first call blocks; the rest drain whatever is
+            // already queued, mirroring epoll_wait returning several ready
+            // fds from one call.
             wait_ms = 0;
         }
 
@@ -409,11 +394,11 @@ impl Drop for Epoll {
     fn drop(&mut self) {
         let mut registrations = self.registrations.lock().unwrap();
         for (_, reg) in registrations.drain() {
-            // Errors here can't be acted on in a `Drop` impl; leaking the
-            // registration on failure is preferable to a panic.
+            // Can't act on errors in a `Drop` impl; leak on failure rather
+            // than panic.
             let _ = unregister(reg);
         }
-        // SAFETY: `self.iocp` is a valid handle owned by this `Epoll`.
+        // SAFETY: `self.iocp` is owned by this `Epoll`.
         unsafe {
             CloseHandle(self.iocp);
         }
@@ -421,11 +406,10 @@ impl Drop for Epoll {
 }
 
 fn unregister(reg: Registration) -> io::Result<()> {
-    // `Epoll::wait` re-arms under the registrations lock, which the caller
-    // holds, so at most one claim is needed -- but the loop stays as a
-    // belt-and-braces guard. The blocking `UnregisterWaitEx` waits until
-    // any in-flight callback for that handle returns, so once the loop
-    // ends nothing can reference `reg.ctx`.
+    // `Epoll::wait` re-arms under the registrations lock this caller holds, so one claim
+    // suffices, but the loop stays as a guard. The blocking `UnregisterWaitEx` waits until
+    // any in-flight callback for that handle returns, so once the loop ends nothing can
+    // reference `reg.ctx`.
     let mut result = Ok(());
     loop {
         // SAFETY: `reg.ctx` is valid until freed below.
@@ -457,15 +441,9 @@ mod tests {
 
     #[test]
     fn test_consume_after_epoll_wait_does_not_deadlock() {
-        // Regression test for the exact `vhost-user-backend` kick pattern:
-        // register a handle with `Epoll`, signal it, `Epoll::wait` for it
-        // (which resets the handle as part of delivery), then consume it
-        // through an `EventConsumer` built from the same handle, the way
-        // `vring.rs` builds one from a wire-delivered handle via
-        // `from_raw_handle`. This must not block: the whole point is that
-        // `Epoll::wait` having already reported the event as ready is
-        // sufficient, and `EventConsumer::consume` must not try to wait
-        // again on an event `Epoll` has already reset.
+        // Regression test for the vhost-user-backend kick pattern: signal,
+        // Epoll::wait (which resets the handle), then consume via an
+        // EventConsumer built from the same handle. Must not block.
         const TIMEOUT: i32 = 5000;
 
         let epoll = Epoll::new().unwrap();
@@ -492,10 +470,8 @@ mod tests {
         // The regression: this used to hang forever.
         consumer.consume().unwrap();
 
-        // `RegisterWaitForSingleObject` requires the registered handle to
-        // stay open until explicitly unregistered (unlike Linux, where
-        // closing a fd implicitly drops it from any epoll interest list) —
-        // delete before `event_fd` drops (and closes its handle) below.
+        // Delete before `event_fd` drops (and closes its handle) — see the
+        // module docs' handle-lifetime requirement.
         epoll
             .ctl(
                 ControlOperation::Delete,
@@ -643,11 +619,8 @@ mod tests {
 
     #[test]
     fn a_thousand_fire_and_rearm_cycles_leak_no_handles() {
-        // Every delivered event re-arms the underlying threadpool wait; a
-        // spent wait registration abandoned per fire shows up as +N here.
-        // Found live: the virtiofsd daemon leaked one handle per FUSE
-        // request. Delta over N rather than exact equality, because other
-        // test threads add background handle noise.
+        // A spent wait registration abandoned per fire shows up as +N here.
+        // Delta over N, not exact equality: other test threads add handle noise.
         const N: u32 = 1000;
         let epoll = Epoll::new().unwrap();
         let event_fd = EventFd::new(0).unwrap();
@@ -681,10 +654,8 @@ mod tests {
 
     #[test]
     fn a_thousand_registration_cycles_leak_no_handles() {
-        // The registration path round-trips a Box through into_raw and a
-        // threadpool wait handle; a leak on either shows up as +N here.
-        // Delta over N rather than exact equality: other test threads add
-        // background handle noise.
+        // A leak in the Box round-trip or the wait handle shows up as +N here.
+        // Delta over N, not exact equality: other test threads add handle noise.
         const N: u32 = 1000;
         let epoll = Epoll::new().unwrap();
         let event_fd = EventFd::new(0).unwrap();

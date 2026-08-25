@@ -5,11 +5,8 @@ pub mod event;
 pub mod eventfd;
 pub mod section;
 
-/// Leak-detection support for tests: this process's kernel handle count.
-///
-/// Tests that create and drop N of something assert the count's delta
-/// stays far below N -- a real per-iteration leak shows up as +N, while
-/// unrelated test threads only add background noise of a few handles.
+/// This process's kernel handle count, for leak-detection tests: a
+/// per-iteration leak over N iterations shows up as a delta near +N.
 #[cfg(test)]
 pub(crate) fn process_handle_count() -> u32 {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
