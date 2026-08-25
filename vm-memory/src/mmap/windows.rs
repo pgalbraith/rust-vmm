@@ -10,7 +10,7 @@ use std::ptr::{null, null_mut};
 
 use libc::{c_void, size_t};
 
-use winapi::um::errhandlingapi::GetLastError;
+use windows_sys::Win32::Foundation::GetLastError;
 
 use crate::bitmap::{Bitmap, NewBitmap, BS};
 use crate::guest_memory::FileOffset;
@@ -337,7 +337,15 @@ mod tests {
     // A view mapped with MapViewOfFile must be released with UnmapViewOfFile; VirtualFree
     // fails on it with ERROR_INVALID_PARAMETER and the view stays mapped. The three tests
     // below pin the release path of each constructor by asking the OS, after the drop,
-    // whether the address range is actually free again.
+    // whether the original allocation still sits at that address.
+    //
+    // The check retries with a fresh region because a single attempt is racy: tests run in
+    // parallel, Windows hands out the lowest free address, and so another thread's mapping
+    // can land exactly at the just-freed base between the drop and the query, looking
+    // identical to a leak (measured at roughly 1 in 20 runs for the file-backed test, by
+    // looping two copies of this test binary concurrently). The two outcomes separate
+    // cleanly under retry: a broken release leaks the original allocation *every* time,
+    // while a reuse collision has to recur independently per attempt.
 
     use libc::{c_void, size_t};
 
@@ -362,9 +370,28 @@ mod tests {
         ) -> size_t;
     }
 
-    const MEM_FREE: u32 = 0x10000;
+    const MEM_COMMIT_STATE: u32 = 0x1000;
+    const MEM_MAPPED: u32 = 0x40000;
+    const MEM_PRIVATE: u32 = 0x20000;
 
-    fn state_of(addr: *mut u8) -> u32 {
+    /// True if dropping a region made by `make` genuinely releases its memory.
+    ///
+    /// Tries up to five times; see the comment above for why one attempt is not enough. A
+    /// broken release fails all five, a parallel-test address-reuse collision does not.
+    fn drops_cleanly(mem_type: u32, mut make: impl FnMut() -> MmapRegion) -> bool {
+        for _ in 0..5 {
+            let region = make();
+            let addr = region.as_ptr();
+            drop(region);
+            if !still_allocated(addr, mem_type) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True if the original allocation of kind `mem_type` still occupies `addr`.
+    fn still_allocated(addr: *mut u8, mem_type: u32) -> bool {
         let mut info = MemoryBasicInformation {
             base_address: std::ptr::null_mut(),
             allocation_base: std::ptr::null_mut(),
@@ -383,36 +410,32 @@ mod tests {
             )
         };
         assert_ne!(len, 0, "VirtualQuery failed");
-        info.state
+        info.state == MEM_COMMIT_STATE
+            && info.type_ == mem_type
+            && std::ptr::eq(info.allocation_base, addr as *mut c_void)
     }
 
     #[test]
     fn dropping_an_anonymous_region_releases_its_memory() {
-        let region = MmapRegion::new(0x1_0000).unwrap();
-        let addr = region.as_ptr();
-        drop(region);
-        assert_eq!(state_of(addr), MEM_FREE);
+        assert!(drops_cleanly(MEM_PRIVATE, || {
+            MmapRegion::new(0x1_0000).unwrap()
+        }));
     }
 
     #[test]
     fn dropping_a_file_backed_region_releases_its_view() {
-        let path = std::env::temp_dir().join(format!(
-            "vm-memory-drop-test-{}.bin",
-            std::process::id()
-        ));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)
-            .unwrap();
-        file.set_len(0x1_0000).unwrap();
-
-        let region = MmapRegion::from_file(FileOffset::new(file, 0), 0x1_0000).unwrap();
-        let addr = region.as_ptr();
-        drop(region);
-        assert_eq!(state_of(addr), MEM_FREE);
-
+        let path =
+            std::env::temp_dir().join(format!("vm-memory-drop-test-{}.bin", std::process::id()));
+        assert!(drops_cleanly(MEM_MAPPED, || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&path)
+                .unwrap();
+            file.set_len(0x1_0000).unwrap();
+            MmapRegion::from_file(FileOffset::new(file, 0), 0x1_0000).unwrap()
+        }));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -420,22 +443,20 @@ mod tests {
     fn dropping_a_section_backed_region_releases_its_view() {
         // A pagefile-backed section, the shape guest memory arrives in over the
         // Windows vhost-user transport.
-        let section = unsafe {
-            super::CreateFileMappingA(
-                INVALID_HANDLE_VALUE,
-                std::ptr::null(),
-                super::PAGE_READWRITE,
-                0,
-                0x1_0000,
-                std::ptr::null(),
-            )
-        };
-        assert!(!section.is_null());
-        let section = unsafe { std::fs::File::from_raw_handle(section) };
-
-        let region = MmapRegion::from_section(&section, 0, 0x1_0000).unwrap();
-        let addr = region.as_ptr();
-        drop(region);
-        assert_eq!(state_of(addr), MEM_FREE);
+        assert!(drops_cleanly(MEM_MAPPED, || {
+            let section = unsafe {
+                super::CreateFileMappingA(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    super::PAGE_READWRITE,
+                    0,
+                    0x1_0000,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!section.is_null());
+            let section = unsafe { std::fs::File::from_raw_handle(section) };
+            MmapRegion::from_section(&section, 0, 0x1_0000).unwrap()
+        }));
     }
 }

@@ -196,7 +196,7 @@ impl NewBitmap for AtomicBitmap {
 
         #[cfg(target_family = "windows")]
         let page_size = {
-            use winapi::um::sysinfoapi::GetSystemInfo;
+            use windows_sys::Win32::System::SystemInformation::GetSystemInfo;
             let mut sysinfo = std::mem::MaybeUninit::zeroed();
             // SAFETY: It's safe to call `GetSystemInfo` as `sysinfo` is rightly sized
             // allocated memory.

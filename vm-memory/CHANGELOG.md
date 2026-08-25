@@ -2,6 +2,12 @@
 
 ## Upcoming
 
+### Changed
+
+- Windows bindings now come from `windows-sys` (the maintained,
+  Microsoft-generated crate) instead of `winapi`. No functional change; the
+  hand-declared `extern` block in `mmap/windows.rs` is unaffected.
+
 ### Fixed
 
 - Allow the default-on `rawfd` feature to build on Windows targets (previously
