@@ -459,4 +459,73 @@ mod tests {
             MmapRegion::from_section(&section, 0, 0x1_0000).unwrap()
         }));
     }
+
+    /// Committed MEM_MAPPED regions in this process, by walking the
+    /// address space.
+    fn mapped_region_count() -> usize {
+        let mut count = 0usize;
+        let mut addr = 0usize;
+        loop {
+            let mut info = MemoryBasicInformation {
+                base_address: std::ptr::null_mut(),
+                allocation_base: std::ptr::null_mut(),
+                allocation_protect: 0,
+                partition_id: 0,
+                region_size: 0,
+                state: 0,
+                protect: 0,
+                type_: 0,
+            };
+            let len = unsafe {
+                VirtualQuery(
+                    addr as *const c_void,
+                    &mut info,
+                    std::mem::size_of::<MemoryBasicInformation>(),
+                )
+            };
+            if len == 0 {
+                break;
+            }
+            if info.state == MEM_COMMIT_STATE && info.type_ == MEM_MAPPED {
+                count += 1;
+            }
+            let next = (info.base_address as usize).saturating_add(info.region_size);
+            if next <= addr {
+                break;
+            }
+            addr = next;
+        }
+        count
+    }
+
+    #[test]
+    fn a_thousand_mapping_cycles_leak_no_views() {
+        // The test the UnmapViewOfFile release bug deserved from the
+        // start: a view leaked per drop shows up here as +N mapped
+        // regions. Delta over N rather than exact equality, because
+        // other test threads map and unmap concurrently.
+        const N: usize = 1000;
+        let section = unsafe {
+            super::CreateFileMappingA(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                super::PAGE_READWRITE,
+                0,
+                0x1000,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        let section = unsafe { std::fs::File::from_raw_handle(section) };
+
+        let before = mapped_region_count();
+        for _ in 0..N {
+            drop(MmapRegion::from_section(&section, 0, 0x1000).unwrap());
+        }
+        let after = mapped_region_count();
+        assert!(
+            after.saturating_sub(before) < N / 2,
+            "mapped regions grew from {before} to {after} over {N} cycles"
+        );
+    }
 }

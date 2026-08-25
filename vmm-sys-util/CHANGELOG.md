@@ -21,6 +21,15 @@
   creation, and most events never cross a process boundary, so naming them
   all only polluted the session's object namespace.
 
+### Fixed
+
+- Windows `Epoll` leaked one threadpool wait handle per delivered event:
+  the callback re-armed by registering a fresh wait and abandoned the
+  spent one, which only `UnregisterWaitEx` can free. Re-arming (and
+  reaping) now happens in `Epoll::wait` when the completion is consumed.
+  Found live as the virtiofsd daemon leaking one handle per FUSE request;
+  leak-cycle tests now pin handle-count deltas across the Windows modules.
+
 ### Changed
 
 - [[#25](https://github.com/rust-vmm/vmm-sys-util/issues/25)]: Mark

@@ -187,4 +187,21 @@ mod tests {
         let adopted = unsafe { Section::from_raw_handle(created.into_raw_handle()) };
         assert!(adopted.name().is_none());
     }
+
+    #[test]
+    fn a_thousand_section_cycles_leak_no_handles() {
+        // Delta over N rather than exact equality: see the eventfd twin.
+        const N: u32 = 1000;
+        let before = crate::windows::process_handle_count();
+        for _ in 0..N {
+            let s = Section::new(0x1000).unwrap();
+            let o = Section::open(s.name().unwrap()).unwrap();
+            drop((s, o));
+        }
+        let after = crate::windows::process_handle_count();
+        assert!(
+            after.saturating_sub(before) < N / 2,
+            "handle count grew from {before} to {after} over {N} cycles"
+        );
+    }
 }

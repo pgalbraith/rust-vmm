@@ -132,39 +132,31 @@ struct WaitCallbackCtx {
 
 // SAFETY: only ever invoked by the Win32 threadpool with the context pointer
 // this callback was registered with, which stays valid until unregistered.
+//
+// Deliberately does NOT re-arm the wait: a spent WT_EXECUTEONLYONCE
+// registration still holds a wait handle that only UnregisterWaitEx can
+// free, and a callback cannot safely unregister itself with the blocking
+// form. Re-arming (and reaping the spent registration) happens in
+// [`Epoll::wait`] when the completion is consumed -- a callback that
+// re-registered and abandoned its spent handle leaked one handle per
+// delivered event, found live as a daemon leaking one handle per FUSE
+// request. The completion key is the context pointer, so `wait` can find
+// the registration to re-arm (and skip completions whose registration was
+// deleted before they were consumed).
 unsafe extern "system" fn wait_callback(param: *mut c_void, _timer_or_wait_fired: bool) {
     // SAFETY: see the function's SAFETY comment.
     let ctx = unsafe { &*(param as *const WaitCallbackCtx) };
 
-    // Reset before re-arming below: a manual-reset event left signaled would
-    // just retrigger the callback immediately.
+    // Reset before posting: a manual-reset event left signaled would just
+    // retrigger the callback the moment `wait` re-arms it.
     // SAFETY: `ctx.handle` is valid for as long as this registration is.
     unsafe {
         ResetEvent(ctx.handle);
     }
     // SAFETY: `ctx.iocp` is valid for as long as this registration is.
     unsafe {
-        PostQueuedCompletionStatus(ctx.iocp, 0, ctx.data as usize, null_mut());
+        PostQueuedCompletionStatus(ctx.iocp, 0, param as usize, null_mut());
     }
-
-    // Re-arm with a fresh WT_EXECUTEONLYONCE wait now that the event is reset.
-    let mut new_wait_handle: HANDLE = null_mut();
-    // SAFETY: `ctx.handle` is valid as above; `param` is this same context.
-    let ret = unsafe {
-        RegisterWaitForSingleObject(
-            &mut new_wait_handle,
-            ctx.handle,
-            Some(wait_callback),
-            param,
-            INFINITE,
-            WT_EXECUTEONLYONCE,
-        )
-    };
-    if ret != 0 {
-        ctx.wait_handle.store(new_wait_handle, Ordering::Release);
-    }
-    // On failure the handle just stops being watched; nothing actionable
-    // from a callback.
 }
 
 /// Wrapper over epoll-like functionality, backed by an I/O completion port.
@@ -348,7 +340,54 @@ impl Epoll {
                 return Err(err);
             }
 
-            events[count] = EpollEvent::new(EventSet::IN, completion_key as u64);
+            // The key is the registration's context pointer (see
+            // wait_callback). Find it among the live registrations: a miss
+            // means the registration was deleted after the completion was
+            // queued, and a deleted handle must not be reported.
+            let registrations = self.registrations.lock().unwrap();
+            let Some(reg) = registrations
+                .values()
+                .find(|reg| reg.ctx as usize == completion_key)
+            else {
+                drop(registrations);
+                wait_ms = 0;
+                continue;
+            };
+            // SAFETY: the registration is in the map, so `ctx` is alive.
+            let ctx = unsafe { &*reg.ctx };
+            let data = ctx.data;
+
+            // Reap the spent wait registration and re-arm. Safe to block
+            // here: this is not a callback thread, and the callback that
+            // posted this completion finished before posting it.
+            let spent = ctx.wait_handle.swap(null_mut(), Ordering::AcqRel);
+            if !spent.is_null() {
+                // SAFETY: `spent` was atomically claimed above.
+                unsafe {
+                    UnregisterWaitEx(spent as HANDLE, INVALID_HANDLE_VALUE);
+                }
+            }
+            let mut new_wait_handle: HANDLE = null_mut();
+            // SAFETY: `ctx.handle` outlives its registration (the caller's
+            // contract, as on Linux), and `reg.ctx` is alive as above.
+            let ret = unsafe {
+                RegisterWaitForSingleObject(
+                    &mut new_wait_handle,
+                    ctx.handle,
+                    Some(wait_callback),
+                    reg.ctx as *mut c_void,
+                    INFINITE,
+                    WT_EXECUTEONLYONCE,
+                )
+            };
+            if ret != 0 {
+                ctx.wait_handle.store(new_wait_handle, Ordering::Release);
+            }
+            // On failure the handle stops being watched; the event itself
+            // is still delivered below.
+            drop(registrations);
+
+            events[count] = EpollEvent::new(EventSet::IN, data);
             count += 1;
             // Only the first call should block; further calls just drain
             // whatever is already queued, mirroring epoll_wait's ability to
@@ -382,11 +421,11 @@ impl Drop for Epoll {
 }
 
 fn unregister(reg: Registration) -> io::Result<()> {
-    // `wait_callback` re-registers itself after every fire, so the current
-    // handle can change concurrently; loop, atomically claiming and
-    // unregistering whatever's current, until none remains. Each
-    // `UnregisterWaitEx` call blocks until any in-flight callback for that
-    // handle returns, so once the loop ends nothing can reference `reg.ctx`.
+    // `Epoll::wait` re-arms under the registrations lock, which the caller
+    // holds, so at most one claim is needed -- but the loop stays as a
+    // belt-and-braces guard. The blocking `UnregisterWaitEx` waits until
+    // any in-flight callback for that handle returns, so once the loop
+    // ends nothing can reference `reg.ctx`.
     let mut result = Ok(());
     loop {
         // SAFETY: `reg.ctx` is valid until freed below.
@@ -600,5 +639,76 @@ mod tests {
                 EpollEvent::default(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn a_thousand_fire_and_rearm_cycles_leak_no_handles() {
+        // Every delivered event re-arms the underlying threadpool wait; a
+        // spent wait registration abandoned per fire shows up as +N here.
+        // Found live: the virtiofsd daemon leaked one handle per FUSE
+        // request. Delta over N rather than exact equality, because other
+        // test threads add background handle noise.
+        const N: u32 = 1000;
+        let epoll = Epoll::new().unwrap();
+        let event_fd = EventFd::new(0).unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                event_fd.as_raw_handle(),
+                EpollEvent::new(EventSet::IN, 7),
+            )
+            .unwrap();
+
+        let mut events = [EpollEvent::default(); 4];
+        // Warm-up so lazily created threadpool machinery is not counted.
+        event_fd.write(1).unwrap();
+        while epoll.wait(1000, &mut events).unwrap() == 0 {}
+
+        let before = crate::windows::process_handle_count();
+        for _ in 0..N {
+            event_fd.write(1).unwrap();
+            while epoll.wait(1000, &mut events).unwrap() == 0 {}
+        }
+        let after = crate::windows::process_handle_count();
+        assert!(
+            after.saturating_sub(before) < N / 2,
+            "handle count grew from {} to {} over {} fire cycles",
+            before,
+            after,
+            N
+        );
+    }
+
+    #[test]
+    fn a_thousand_registration_cycles_leak_no_handles() {
+        // The registration path round-trips a Box through into_raw and a
+        // threadpool wait handle; a leak on either shows up as +N here.
+        // Delta over N rather than exact equality: other test threads add
+        // background handle noise.
+        const N: u32 = 1000;
+        let epoll = Epoll::new().unwrap();
+        let event_fd = EventFd::new(0).unwrap();
+        let before = crate::windows::process_handle_count();
+        for i in 0..N {
+            epoll
+                .ctl(
+                    ControlOperation::Add,
+                    event_fd.as_raw_handle(),
+                    EpollEvent::new(EventSet::IN, i as u64),
+                )
+                .unwrap();
+            epoll
+                .ctl(
+                    ControlOperation::Delete,
+                    event_fd.as_raw_handle(),
+                    EpollEvent::new(EventSet::empty(), 0),
+                )
+                .unwrap();
+        }
+        let after = crate::windows::process_handle_count();
+        assert!(
+            after.saturating_sub(before) < N / 2,
+            "handle count grew from {before} to {after} over {N} cycles"
+        );
     }
 }

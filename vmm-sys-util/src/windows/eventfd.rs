@@ -129,8 +129,8 @@ impl EventFd {
     }
 
     /// Open an existing named manual-reset event object created by a peer
-    /// process (e.g. via [`EventFd::new`] there, with the name communicated
-    /// out of band).
+    /// process (e.g. via [`EventFd::new_shareable`] there, with the name
+    /// communicated out of band).
     ///
     /// # Arguments
     ///
@@ -376,5 +376,24 @@ mod tests {
         // SAFETY: the handle comes straight from into_raw_handle.
         let adopted = unsafe { EventFd::from_raw_handle(cloned.into_raw_handle()) };
         assert!(adopted.name().is_none());
+    }
+
+    #[test]
+    fn a_thousand_eventfd_cycles_leak_no_handles() {
+        // Delta over N rather than exact equality: other test threads
+        // add background handle noise, but a per-iteration leak adds N.
+        const N: u32 = 1000;
+        let before = crate::windows::process_handle_count();
+        for _ in 0..N {
+            let e = EventFd::new_shareable(0).unwrap();
+            let c = e.try_clone().unwrap();
+            let o = EventFd::open(e.name().unwrap()).unwrap();
+            drop((e, c, o));
+        }
+        let after = crate::windows::process_handle_count();
+        assert!(
+            after.saturating_sub(before) < N / 2,
+            "handle count grew from {before} to {after} over {N} cycles"
+        );
     }
 }
