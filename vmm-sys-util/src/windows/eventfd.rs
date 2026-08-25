@@ -8,9 +8,14 @@
 //! only signal and wait, which is sufficient for doorbell use (kick, call,
 //! wake-up) — the only way this type is used across rust-vmm.
 //!
-//! [`EventFd::new`] mints a process-unique name; a peer process can open the
-//! same event with [`EventFd::open`] if that name is passed to it out of
-//! band (e.g. over a control socket).
+//! [`EventFd::new`] creates an anonymous event. An event meant for another
+//! process is created with [`EventFd::new_shareable`] instead, which mints a
+//! process-unique name the peer can [`open`](EventFd::open) once it is passed
+//! out of band (e.g. over a control socket). The split exists because a Win32
+//! object's name can only be given at creation — there is no naming an event
+//! after the fact — and most events (wakeups, internal doorbells) never cross
+//! a process boundary, so naming them all would only pollute the session's
+//! object namespace.
 
 use std::ffi::CString;
 use std::io;
@@ -70,13 +75,33 @@ unsafe impl Send for EventFd {}
 unsafe impl Sync for EventFd {}
 
 impl EventFd {
-    /// Create a new `EventFd`, backed by a freshly created, uniquely named
+    /// Create a new anonymous `EventFd`, backed by a freshly created
     /// manual-reset event object.
     ///
     /// # Arguments
     ///
     /// * `flag`: only [`EFD_NONBLOCK`] has any effect; see the module docs.
     pub fn new(flag: i32) -> result::Result<EventFd, io::Error> {
+        // SAFETY: all arguments are simple values; the return value is
+        // checked for failure.
+        let handle = unsafe { CreateEventA(null(), 1, 0, std::ptr::null()) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(EventFd {
+            event: handle,
+            nonblock: flag & EFD_NONBLOCK != 0,
+            name: None,
+        })
+    }
+
+    /// Create a new `EventFd` under a freshly minted, process-unique name,
+    /// for handing to another process (see the module docs).
+    ///
+    /// # Arguments
+    ///
+    /// * `flag`: only [`EFD_NONBLOCK`] has any effect; see the module docs.
+    pub fn new_shareable(flag: i32) -> result::Result<EventFd, io::Error> {
         let name = unique_name();
         // SAFETY: `name` is a valid, NUL-terminated C string that outlives
         // the call; all other arguments are simple values. We check the
@@ -93,8 +118,10 @@ impl EventFd {
     }
 
     /// The object's name, for transmitting to a peer that will
-    /// [`open`](EventFd::open) the same event; `None` when the event
-    /// arrived as a bare handle and the name is unknown.
+    /// [`open`](EventFd::open) the same event; `Some` only for events
+    /// from [`new_shareable`](EventFd::new_shareable) or
+    /// [`open`](EventFd::open) — an anonymous or bare-handle event has
+    /// none to give.
     pub fn name(&self) -> Option<&str> {
         // The name was built from (or validated as) a Rust string, so
         // it converts back losslessly.
@@ -320,11 +347,11 @@ mod tests {
     }
 
     #[test]
-    fn a_created_eventfd_carries_its_name_for_a_peer_to_open() {
+    fn a_shareable_eventfd_carries_its_name_for_a_peer_to_open() {
         // The frontend side of a transport creates the event and sends
         // its name; without retention nothing could be transmitted.
-        let evt = EventFd::new(0).unwrap();
-        let name = evt.name().expect("a created EventFd must know its name");
+        let evt = EventFd::new_shareable(0).unwrap();
+        let name = evt.name().expect("a shareable EventFd must know its name");
         assert!(name.starts_with("vmm-sys-util-evt-"));
 
         let opened = EventFd::open(name).unwrap();
@@ -333,8 +360,16 @@ mod tests {
     }
 
     #[test]
-    fn a_clone_keeps_the_name_and_a_bare_handle_loses_it() {
+    fn a_plain_eventfd_is_anonymous() {
+        // Most events never cross a process boundary; they should not
+        // occupy the session's object namespace.
         let evt = EventFd::new(0).unwrap();
+        assert!(evt.name().is_none());
+    }
+
+    #[test]
+    fn a_clone_keeps_the_name_and_a_bare_handle_loses_it() {
+        let evt = EventFd::new_shareable(0).unwrap();
         let cloned = evt.try_clone().unwrap();
         assert_eq!(cloned.name(), evt.name());
 

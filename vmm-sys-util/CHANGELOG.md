@@ -14,9 +14,12 @@
   tracked on the `windows-support` branch.
 - Windows `section::Section`: a named, pagefile-backed section object — the
   create/name/open half of cross-process shared memory, complementing
-  `vm-memory`'s `MmapRegion::from_section` mapping half. `EventFd` now also
-  retains the name it mints (`EventFd::name()`), so the creating side of a
-  transport can transmit it to a peer.
+  `vm-memory`'s `MmapRegion::from_section` mapping half.
+- Windows `EventFd::new_shareable()`: creates the event under a retained,
+  process-unique name (`EventFd::name()`) for handing to a peer. Plain
+  `EventFd::new()` is anonymous again — a Win32 object can only be named at
+  creation, and most events never cross a process boundary, so naming them
+  all only polluted the session's object namespace.
 
 ### Changed
 
