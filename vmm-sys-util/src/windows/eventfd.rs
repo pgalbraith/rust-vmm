@@ -16,16 +16,19 @@ use std::ffi::CString;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, RawHandle};
 use std::process;
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 use std::result;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use winapi::shared::winerror::WAIT_TIMEOUT;
-use winapi::um::handleapi::{CloseHandle, DuplicateHandle};
-use winapi::um::processthreadsapi::GetCurrentProcess;
-use winapi::um::synchapi::{CreateEventA, OpenEventA, ResetEvent, SetEvent, WaitForSingleObject};
-use winapi::um::winbase::{INFINITE, WAIT_FAILED, WAIT_OBJECT_0};
-use winapi::um::winnt::{DUPLICATE_SAME_ACCESS, EVENT_MODIFY_STATE, HANDLE, SYNCHRONIZE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+use windows_sys::Win32::System::Threading::{
+    CreateEventA, GetCurrentProcess, OpenEventA, ResetEvent, SetEvent, WaitForSingleObject,
+    EVENT_MODIFY_STATE, INFINITE,
+};
 
 // Reexported so callers can write `#[cfg]`-free code across platforms; only
 // `EFD_NONBLOCK` has any effect here. `EFD_SEMAPHORE` and `EFD_CLOEXEC` have
@@ -75,7 +78,7 @@ impl EventFd {
         // SAFETY: `name` is a valid, NUL-terminated C string that outlives
         // the call; all other arguments are simple values. We check the
         // return value for failure.
-        let handle = unsafe { CreateEventA(null_mut(), 1, 0, name.as_ptr()) };
+        let handle = unsafe { CreateEventA(null(), 1, 0, name.as_ptr().cast()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -97,7 +100,8 @@ impl EventFd {
         let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: `name` is a valid, NUL-terminated C string that outlives
         // the call. We check the return value for failure.
-        let handle = unsafe { OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, 0, name.as_ptr()) };
+        let handle =
+            unsafe { OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, 0, name.as_ptr().cast()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -277,10 +281,10 @@ mod tests {
         // SAFETY: name is a valid C string with no interior NUL.
         let handle = unsafe {
             CreateEventA(
-                null_mut(),
+                null(),
                 1,
                 0,
-                CString::new(name.clone()).unwrap().as_ptr(),
+                CString::new(name.clone()).unwrap().as_ptr().cast(),
             )
         };
         assert!(!handle.is_null());

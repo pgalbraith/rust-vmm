@@ -22,19 +22,17 @@ serde = { version = "1.0.27", optional = true }
 serde_derive = { version = "1.0.27", optional = true }
 bitflags = "2.13"
 
-[target.'cfg(target_family = "windows")'.dependencies.winapi]
-version = "0.3"
+# `Win32_Security` looks out of place but is required: `CreateEventA` is gated on it
+# because its first parameter is a `*const SECURITY_ATTRIBUTES`. `SYNCHRONIZE` lives
+# under `Win32_Storage_FileSystem` (generic access rights are grouped there).
+[target.'cfg(target_family = "windows")'.dependencies.windows-sys]
+version = "0.61"
 features = [
-    "synchapi",
-    "handleapi",
-    "ioapiset",
-    "winbase",
-    "threadpoollegacyapiset",
-    "winnt",
-    "winerror",
-    "processthreadsapi",
-    "errhandlingapi",
-    "minwinbase",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
 ]
 
 [dev-dependencies]

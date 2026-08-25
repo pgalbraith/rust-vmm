@@ -21,16 +21,15 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Mutex;
 
-use winapi::ctypes::c_void;
-use winapi::shared::winerror::WAIT_TIMEOUT;
-use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-use winapi::um::ioapiset::PostQueuedCompletionStatus;
-use winapi::um::ioapiset::{CreateIoCompletionPort, GetQueuedCompletionStatus};
-use winapi::um::minwinbase::OVERLAPPED;
-use winapi::um::synchapi::ResetEvent;
-use winapi::um::threadpoollegacyapiset::UnregisterWaitEx;
-use winapi::um::winbase::{RegisterWaitForSingleObject, INFINITE};
-use winapi::um::winnt::{HANDLE, WT_EXECUTEONLYONCE};
+use std::ffi::c_void;
+
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
+use windows_sys::Win32::System::Threading::{
+    RegisterWaitForSingleObject, ResetEvent, UnregisterWaitEx, INFINITE, WT_EXECUTEONLYONCE,
+};
+use windows_sys::Win32::System::IO::{
+    CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus, OVERLAPPED,
+};
 
 bitflags::bitflags! {
     /// The type of events that can be monitored for a handle.
@@ -133,7 +132,7 @@ struct WaitCallbackCtx {
 
 // SAFETY: only ever invoked by the Win32 threadpool with the context pointer
 // this callback was registered with, which stays valid until unregistered.
-unsafe extern "system" fn wait_callback(param: *mut c_void, _timer_or_wait_fired: u8) {
+unsafe extern "system" fn wait_callback(param: *mut c_void, _timer_or_wait_fired: bool) {
     // SAFETY: see the function's SAFETY comment.
     let ctx = unsafe { &*(param as *const WaitCallbackCtx) };
 

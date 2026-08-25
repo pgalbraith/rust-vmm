@@ -9,8 +9,9 @@
   (`EventConsumer`/`EventNotifier`), gated to `cfg(target_family = "windows")`.
   `EventFd` is backed by a named, manual-reset Win32 event and is signal-only
   (no counter, unlike Linux eventfd); `Epoll` is backed by an I/O completion
-  port and supports only `EventSet::IN`. No PR yet — tracked on the
-  `windows-support` branch.
+  port and supports only `EventSet::IN`. Bound through `windows-sys` (the
+  maintained, Microsoft-generated bindings) rather than `winapi`. No PR yet —
+  tracked on the `windows-support` branch.
 
 ### Changed
 
