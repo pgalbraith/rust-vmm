@@ -55,6 +55,9 @@ fn unique_name() -> CString {
 pub struct EventFd {
     event: HANDLE,
     nonblock: bool,
+    /// The object's name; `None` when the event arrived as a bare handle
+    /// ([`FromRawHandle`]) and its name is unknown.
+    name: Option<CString>,
 }
 
 // SAFETY: a Win32 HANDLE has no thread affinity; it is safe to use from any
@@ -85,7 +88,17 @@ impl EventFd {
         Ok(EventFd {
             event: handle,
             nonblock: flag & EFD_NONBLOCK != 0,
+            name: Some(name),
         })
+    }
+
+    /// The object's name, for transmitting to a peer that will
+    /// [`open`](EventFd::open) the same event; `None` when the event
+    /// arrived as a bare handle and the name is unknown.
+    pub fn name(&self) -> Option<&str> {
+        // The name was built from (or validated as) a Rust string, so
+        // it converts back losslessly.
+        self.name.as_ref().and_then(|n| n.to_str().ok())
     }
 
     /// Open an existing named manual-reset event object created by a peer
@@ -108,6 +121,7 @@ impl EventFd {
         Ok(EventFd {
             event: handle,
             nonblock: false,
+            name: Some(name),
         })
     }
 
@@ -207,6 +221,9 @@ impl EventFd {
         Ok(EventFd {
             event: new_handle,
             nonblock: self.nonblock,
+            // The duplicate refers to the same kernel object, so the
+            // object's name is unchanged.
+            name: self.name.clone(),
         })
     }
 }
@@ -222,6 +239,7 @@ impl FromRawHandle for EventFd {
         EventFd {
             event: handle as HANDLE,
             nonblock: false,
+            name: None,
         }
     }
 }
@@ -299,5 +317,29 @@ mod tests {
     #[test]
     fn test_open_missing() {
         assert!(EventFd::open("vmm-sys-util-evt-does-not-exist").is_err());
+    }
+
+    #[test]
+    fn a_created_eventfd_carries_its_name_for_a_peer_to_open() {
+        // The frontend side of a transport creates the event and sends
+        // its name; without retention nothing could be transmitted.
+        let evt = EventFd::new(0).unwrap();
+        let name = evt.name().expect("a created EventFd must know its name");
+        assert!(name.starts_with("vmm-sys-util-evt-"));
+
+        let opened = EventFd::open(name).unwrap();
+        evt.write(1).unwrap();
+        assert_eq!(opened.read().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_clone_keeps_the_name_and_a_bare_handle_loses_it() {
+        let evt = EventFd::new(0).unwrap();
+        let cloned = evt.try_clone().unwrap();
+        assert_eq!(cloned.name(), evt.name());
+
+        // SAFETY: the handle comes straight from into_raw_handle.
+        let adopted = unsafe { EventFd::from_raw_handle(cloned.into_raw_handle()) };
+        assert!(adopted.name().is_none());
     }
 }
