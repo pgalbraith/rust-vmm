@@ -45,6 +45,8 @@ extern "system" {
         dwNumberOfBytesToMap: size_t,
     ) -> *mut c_void;
 
+    pub fn UnmapViewOfFile(lpBaseAddress: *const c_void) -> u32; // BOOL
+
     pub fn CloseHandle(hObject: RawHandle) -> u32; // BOOL
 }
 
@@ -75,6 +77,10 @@ pub struct MmapRegion<B> {
     size: usize,
     bitmap: B,
     file_offset: Option<FileOffset>,
+    /// Whether `addr` is a view mapped with `MapViewOfFile` (from a file or a section) rather
+    /// than memory from `VirtualAlloc`. The two have disjoint release functions, and calling
+    /// the wrong one fails with `ERROR_INVALID_PARAMETER` and leaks the mapping.
+    mapped_view: bool,
 }
 
 // Send and Sync aren't automatically inherited for the raw address pointer.
@@ -104,6 +110,7 @@ impl<B: NewBitmap> MmapRegion<B> {
             size,
             bitmap: B::with_len(size),
             file_offset: None,
+            mapped_view: false,
         })
     }
 
@@ -159,6 +166,7 @@ impl<B: NewBitmap> MmapRegion<B> {
             size,
             bitmap: B::with_len(size),
             file_offset: Some(file_offset),
+            mapped_view: true,
         })
     }
 
@@ -209,6 +217,7 @@ impl<B: NewBitmap> MmapRegion<B> {
             // Deliberately `None`: the region is not backed by a file, and reporting a fabricated
             // `FileOffset` would suggest a caller could re-derive the mapping from one.
             file_offset: None,
+            mapped_view: true,
         })
     }
 }
@@ -271,12 +280,18 @@ impl<B: Bitmap> VolatileMemory for MmapRegion<B> {
 
 impl<B> Drop for MmapRegion<B> {
     fn drop(&mut self) {
-        // This is safe because we mmap the area at addr ourselves, and nobody
+        // This is safe because we mapped the area at addr ourselves, and nobody
         // else is holding a reference to it.
-        // Note that the size must be set to 0 when using MEM_RELEASE,
-        // otherwise the function fails.
+        // A view from MapViewOfFile must be released with UnmapViewOfFile;
+        // VirtualAlloc'd memory must be released with VirtualFree (with size 0
+        // when using MEM_RELEASE, otherwise the function fails). Each fails
+        // with ERROR_INVALID_PARAMETER on the other's memory, leaking it.
         unsafe {
-            let ret_val = VirtualFree(self.addr as *mut libc::c_void, 0, MEM_RELEASE);
+            let ret_val = if self.mapped_view {
+                UnmapViewOfFile(self.addr as *const libc::c_void)
+            } else {
+                VirtualFree(self.addr as *mut libc::c_void, 0, MEM_RELEASE)
+            };
             if ret_val == 0 {
                 let err = GetLastError();
                 // We can't use any fancy logger here, yet we want to
@@ -317,5 +332,110 @@ mod tests {
         // the rest of the unit tests above.
         let m = crate::MmapRegion::<AtomicBitmap>::new(0x1_0000).unwrap();
         crate::bitmap::tests::test_volatile_memory(&m);
+    }
+
+    // A view mapped with MapViewOfFile must be released with UnmapViewOfFile; VirtualFree
+    // fails on it with ERROR_INVALID_PARAMETER and the view stays mapped. The three tests
+    // below pin the release path of each constructor by asking the OS, after the drop,
+    // whether the address range is actually free again.
+
+    use libc::{c_void, size_t};
+
+    #[repr(C)]
+    struct MemoryBasicInformation {
+        base_address: *mut c_void,
+        allocation_base: *mut c_void,
+        allocation_protect: u32,
+        partition_id: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        type_: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn VirtualQuery(
+            lpAddress: *const c_void,
+            lpBuffer: *mut MemoryBasicInformation,
+            dwLength: size_t,
+        ) -> size_t;
+    }
+
+    const MEM_FREE: u32 = 0x10000;
+
+    fn state_of(addr: *mut u8) -> u32 {
+        let mut info = MemoryBasicInformation {
+            base_address: std::ptr::null_mut(),
+            allocation_base: std::ptr::null_mut(),
+            allocation_protect: 0,
+            partition_id: 0,
+            region_size: 0,
+            state: 0,
+            protect: 0,
+            type_: 0,
+        };
+        let len = unsafe {
+            VirtualQuery(
+                addr as *const c_void,
+                &mut info,
+                std::mem::size_of::<MemoryBasicInformation>(),
+            )
+        };
+        assert_ne!(len, 0, "VirtualQuery failed");
+        info.state
+    }
+
+    #[test]
+    fn dropping_an_anonymous_region_releases_its_memory() {
+        let region = MmapRegion::new(0x1_0000).unwrap();
+        let addr = region.as_ptr();
+        drop(region);
+        assert_eq!(state_of(addr), MEM_FREE);
+    }
+
+    #[test]
+    fn dropping_a_file_backed_region_releases_its_view() {
+        let path = std::env::temp_dir().join(format!(
+            "vm-memory-drop-test-{}.bin",
+            std::process::id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(0x1_0000).unwrap();
+
+        let region = MmapRegion::from_file(FileOffset::new(file, 0), 0x1_0000).unwrap();
+        let addr = region.as_ptr();
+        drop(region);
+        assert_eq!(state_of(addr), MEM_FREE);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dropping_a_section_backed_region_releases_its_view() {
+        // A pagefile-backed section, the shape guest memory arrives in over the
+        // Windows vhost-user transport.
+        let section = unsafe {
+            super::CreateFileMappingA(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                super::PAGE_READWRITE,
+                0,
+                0x1_0000,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        let section = unsafe { std::fs::File::from_raw_handle(section) };
+
+        let region = MmapRegion::from_section(&section, 0, 0x1_0000).unwrap();
+        let addr = region.as_ptr();
+        drop(region);
+        assert_eq!(state_of(addr), MEM_FREE);
     }
 }

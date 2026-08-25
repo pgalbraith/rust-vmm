@@ -475,6 +475,9 @@ mod tests {
     #[test]
     #[cfg(feature = "rawfd")]
     #[cfg(not(miri))]
+    // `ReadVolatile`/`WriteVolatile` for `File` are only implemented on unix (see io.rs);
+    // the Windows arms below date from before that gating and cannot compile here.
+    #[cfg(target_family = "unix")]
     fn read_to_and_write_from_mem() {
         use std::mem;
 
