@@ -190,6 +190,17 @@ impl<B: NewBitmap> MmapRegion<B> {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
 
+        // A `size` of 0 is special-cased by `MapViewOfFile` to map from `offset` to the end of the
+        // section, which would leave the view and this region's recorded length disagreeing. Reject
+        // it: a real region is never empty, and `offset`/`size` here can come off the wire.
+        if size == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        // `offset` and `size` are trusted only as far as the kernel enforces them: `MapViewOfFile`
+        // fails (NULL) if `offset` is not allocation-granularity aligned or `offset + size` exceeds
+        // the section, so an out-of-range request becomes an error below rather than an out-of-bounds
+        // view. The section's own size is not queryable before mapping, so this is the bounds check.
         // The section already is the mapping object, so unlike `from_file` there's nothing to create.
         let addr = unsafe {
             MapViewOfFile(
