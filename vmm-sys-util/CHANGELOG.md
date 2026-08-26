@@ -29,6 +29,22 @@
 - Windows `Epoll` leaked one threadpool wait handle per delivered event.
   Re-arming and reaping the spent registration now happens in
   `Epoll::wait` instead of the callback.
+- Windows `EventFd` is now backed by an auto-reset event instead of
+  manual-reset, making consumption atomic in the kernel: one `write`
+  wakes exactly one reader (two racing `read`s could previously both
+  consume a single signal), `Epoll` no longer resets handles it doesn't
+  own, and a failed completion-port post re-signals the event instead of
+  losing the doorbell. The `Epoll` wait registration is persistent now,
+  eliminating the per-event unregister/re-register churn. Reset mode is a
+  property of the object and follows the waiter: a peer-minted event this
+  side waits on (kick) must be created auto-reset (`bManualReset =
+  FALSE`); events this side only signals (call/err) are mode-agnostic. In
+  debug builds, `Epoll::ctl` asserts that a registered event is
+  auto-reset rather than letting a manual-reset one hot-spin.
+- Windows `EventConsumer::consume` is a strict no-op: the signal is
+  already consumed by the wait that reported readiness, and even a
+  zero-timeout wait here could eat the next signal before `Epoll`
+  delivers it.
 
 ### Changed
 

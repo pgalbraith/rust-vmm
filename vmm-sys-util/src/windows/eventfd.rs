@@ -2,11 +2,27 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Windows analog of Linux [`eventfd`](http://man7.org/linux/man-pages/man2/eventfd.2.html),
-//! backed by a manual-reset Win32 event object.
+//! backed by an auto-reset Win32 event object.
 //!
 //! A Win32 event has no counter, just signaled/not. [`EventFd::write`] and
 //! [`EventFd::read`] only signal and wait — no add/drain semantics. That's
 //! enough for doorbell use, the only way eventfd is used in rust-vmm.
+//!
+//! Auto-reset matters: the kernel consumes the signal atomically as part of
+//! satisfying a wait, so one `write` wakes exactly one waiter — matching
+//! Linux eventfd's atomic read — with no separate reset step to race
+//! against. Every event this module creates is auto-reset.
+//!
+//! Reset mode is a property of the object, not the handle, and the rule for
+//! peer-created events follows the *waiter*: an event this side will wait
+//! on ([`EventFd::read`], or registration with [`crate::epoll::Epoll`])
+//! must be created auto-reset by its minting process; an event this side
+//! only ever signals ([`EventFd::write`]) works either way — `SetEvent`
+//! is mode-agnostic. A creator cannot *prove* it got auto-reset —
+//! `CreateEventA` over an existing name silently ignores `bManualReset`
+//! and returns the existing object — which is why creation here fails on
+//! `ERROR_ALREADY_EXISTS` instead of proceeding with an object whose
+//! semantics someone else chose.
 //!
 //! [`EventFd::new`] creates an anonymous event. [`EventFd::new_shareable`]
 //! mints an unguessable name instead, for a peer to open via
@@ -25,8 +41,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Threading::{
-    CreateEventA, GetCurrentProcess, OpenEventA, ResetEvent, SetEvent, WaitForSingleObject,
-    EVENT_MODIFY_STATE, INFINITE,
+    CreateEventA, GetCurrentProcess, OpenEventA, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
+    INFINITE,
 };
 
 use crate::windows::named_object;
@@ -44,13 +60,13 @@ fn unique_name() -> CString {
     named_object::unique_name("vmm-sys-util-evt-")
 }
 
-/// Create a manual-reset event under `name` with a creator-only DACL,
+/// Create an auto-reset event under `name` with a creator-only DACL,
 /// failing (rather than adopting the impostor) if the name is taken.
 fn create_named_event(name: &CString) -> io::Result<HANDLE> {
     let sa = named_object::creator_only_attributes()?;
     // SAFETY: `sa` and `name` are valid for the duration of the call; the
     // return value is checked.
-    let handle = unsafe { CreateEventA(&sa, 1, 0, name.as_ptr().cast()) };
+    let handle = unsafe { CreateEventA(&sa, 0, 0, name.as_ptr().cast()) };
     if handle.is_null() {
         return Err(io::Error::last_os_error());
     }
@@ -86,7 +102,7 @@ impl EventFd {
     pub fn new(flag: i32) -> result::Result<EventFd, io::Error> {
         // SAFETY: all arguments are simple values; the return value is
         // checked for failure.
-        let handle = unsafe { CreateEventA(null(), 1, 0, std::ptr::null()) };
+        let handle = unsafe { CreateEventA(null(), 0, 0, std::ptr::null()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -128,19 +144,31 @@ impl EventFd {
         self.name.as_ref().and_then(|n| n.to_str().ok())
     }
 
-    /// Open an existing named manual-reset event object created by a peer
-    /// process (e.g. via [`EventFd::new_shareable`] there, with the name
-    /// communicated out of band).
+    /// Open an existing named event object created by a peer process (e.g.
+    /// via [`EventFd::new_shareable`] there, with the name communicated out
+    /// of band).
+    ///
+    /// The handle asks for signal, wait, and state-query access — the last
+    /// so that [`crate::epoll::Epoll`]'s debug-build check can verify the
+    /// event is auto-reset (see the module docs); a creator restricting
+    /// its DACL below `EVENT_QUERY_STATE` breaks that verification.
     ///
     /// # Arguments
     ///
     /// * `name`: the name the creating process minted; must not contain an
     ///   interior NUL byte.
     pub fn open(name: &str) -> result::Result<EventFd, io::Error> {
+        // Not exposed outside windows-sys's Wdk tree; the value is fixed.
+        const EVENT_QUERY_STATE: u32 = 0x0001;
         let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: `name` is a valid NUL-terminated C string outliving the call.
-        let handle =
-            unsafe { OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, 0, name.as_ptr().cast()) };
+        let handle = unsafe {
+            OpenEventA(
+                EVENT_MODIFY_STATE | EVENT_QUERY_STATE | SYNCHRONIZE,
+                0,
+                name.as_ptr().cast(),
+            )
+        };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -170,7 +198,11 @@ impl EventFd {
         Ok(())
     }
 
-    /// Wait for the event to become signaled, then reset it.
+    /// Wait for the event to become signaled, consuming the signal.
+    ///
+    /// The event is auto-reset, so consumption is atomic in the kernel:
+    /// one [`write`](EventFd::write) releases exactly one reader, even
+    /// with several blocked concurrently.
     ///
     /// Returns `Ok(1)` on success as a placeholder: there is no real counter
     /// value to return (see the module docs). If the `EventFd` was created
@@ -185,28 +217,14 @@ impl EventFd {
         }
     }
 
-    /// Non-blocking check for a pending signal: resets it if signaled, and
-    /// returns `Ok(())` either way — never waits, unlike [`EventFd::read`].
-    /// Used by [`crate::event::EventConsumer`], which may run after
-    /// [`crate::epoll::Epoll::wait`] has already reset the handle.
-    pub(crate) fn try_consume(&self) -> result::Result<(), io::Error> {
-        self.wait_for_signal(0).map(|_| ())
-    }
-
-    /// Waits up to `timeout_ms` for the event to become signaled, resetting
-    /// it if so. Returns `Ok(true)` if signaled (and reset), `Ok(false)` on
+    /// Waits up to `timeout_ms` for the event to become signaled. The event
+    /// is auto-reset, so a satisfied wait consumes the signal atomically.
+    /// Returns `Ok(true)` if signaled (and consumed), `Ok(false)` on
     /// timeout.
     fn wait_for_signal(&self, timeout_ms: u32) -> result::Result<bool, io::Error> {
         // SAFETY: `self.event` is valid for the lifetime of `self`.
         let ret = unsafe { WaitForSingleObject(self.event, timeout_ms) };
         if ret == WAIT_OBJECT_0 {
-            // Reset only after the wait succeeds: a signal racing this
-            // reset just leaves the event signaled again, not lost.
-            // SAFETY: `self.event` is valid for the lifetime of `self`.
-            let ret = unsafe { ResetEvent(self.event) };
-            if ret == 0 {
-                return Err(io::Error::last_os_error());
-            }
             Ok(true)
         } else if ret == WAIT_TIMEOUT {
             Ok(false)
@@ -310,6 +328,30 @@ mod tests {
     }
 
     #[test]
+    fn a_single_write_wakes_exactly_one_reader() {
+        // Auto-reset regression: consumption is atomic in the kernel, so
+        // one write must satisfy exactly one read, even when several
+        // threads race for it. The manual-reset implementation (wait, then
+        // a separate ResetEvent) let two racing readers both return Ok.
+        let evt = std::sync::Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        evt.write(1).unwrap();
+
+        let successes: usize = (0..4)
+            .map(|_| {
+                let evt = evt.clone();
+                std::thread::spawn(move || evt.read().is_ok())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap() as usize)
+            .sum();
+        assert_eq!(successes, 1);
+
+        // And the signal is gone afterwards.
+        assert_eq!(evt.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
     fn test_clone() {
         let evt = EventFd::new(EFD_NONBLOCK).unwrap();
         let evt_clone = evt.try_clone().unwrap();
@@ -324,7 +366,7 @@ mod tests {
         let handle = unsafe {
             CreateEventA(
                 null(),
-                1,
+                0,
                 0,
                 CString::new(name.clone()).unwrap().as_ptr().cast(),
             )

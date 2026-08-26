@@ -2,12 +2,21 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Windows analog of Linux [`epoll`](http://man7.org/linux/man-pages/man7/epoll.7.html),
-//! backed by an I/O completion port and one threadpool wait per handle.
+//! backed by an I/O completion port and one persistent threadpool wait per
+//! handle.
 //!
 //! Only [`EventSet::IN`] is supported; [`Epoll::ctl`] rejects any other bit
-//! rather than silently ignoring it. [`Epoll::wait`] resets a handle's event
-//! as part of delivering its wake-up, so a consumer (e.g.
-//! [`crate::event::EventConsumer::consume`]) must not block on it again.
+//! rather than silently ignoring it. Registered handles are expected to be
+//! auto-reset events (what [`crate::eventfd::EventFd`] creates): satisfying
+//! the wait consumes the signal atomically in the kernel, so each signal is
+//! delivered as exactly one wake-up and nothing here ever mutates the
+//! handle's state behind the caller's back. Anything running after the
+//! wake-up must leave the handle alone — the signal is already consumed,
+//! and even a zero-timeout wait could eat the *next* signal before this
+//! `Epoll` delivers it ([`crate::event::EventConsumer::consume`] is
+//! accordingly a no-op on Windows). A manual-reset event, by contrast,
+//! would storm: it stays signaled, and the persistent wait would fire
+//! continuously.
 //!
 //! A registered handle must be removed with [`ControlOperation::Delete`] (or
 //! by dropping the `Epoll`) before it's closed — unlike Linux, closing first
@@ -17,14 +26,15 @@ use std::collections::HashMap;
 use std::io;
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Mutex;
 
 use std::ffi::c_void;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_INVALID_HANDLE, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::System::Threading::{
-    RegisterWaitForSingleObject, ResetEvent, UnregisterWaitEx, INFINITE, WT_EXECUTEONLYONCE,
+    RegisterWaitForSingleObject, SetEvent, UnregisterWaitEx, INFINITE, WT_EXECUTEDEFAULT,
 };
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus, OVERLAPPED,
@@ -115,6 +125,9 @@ impl EpollEvent {
 }
 
 struct Registration {
+    /// The persistent threadpool wait for this handle; freed by
+    /// `UnregisterWaitEx` in `unregister`.
+    wait_handle: HANDLE,
     ctx: *mut WaitCallbackCtx,
 }
 
@@ -122,33 +135,36 @@ struct WaitCallbackCtx {
     iocp: HANDLE,
     handle: HANDLE,
     data: u64,
-    // Current WT_EXECUTEONLYONCE registration for `handle`; re-armed by
-    // `wait_callback` after each fire (see its comment).
-    wait_handle: AtomicPtr<c_void>,
 }
 
 // SAFETY: only ever invoked by the Win32 threadpool with the context pointer
-// this callback was registered with, which stays valid until unregistered.
+// this callback was registered with, which stays valid until unregistered
+// (the blocking `UnregisterWaitEx` in `unregister` waits out any in-flight
+// invocation).
 //
-// Deliberately does NOT re-arm the wait: a spent WT_EXECUTEONLYONCE
-// registration holds a wait handle only `UnregisterWaitEx` can free, and a
-// callback can't safely unregister itself with the blocking form.
-// [`Epoll::wait`] re-arms and reaps the spent registration when it consumes
-// the completion, keyed by this context pointer (also letting it skip
-// completions whose registration was deleted first).
+// The registration is persistent and the handle auto-reset: the kernel
+// consumed the signal to satisfy the wait, so this callback only relays the
+// wake-up to the completion port and never touches the handle's state.
 unsafe extern "system" fn wait_callback(param: *mut c_void, _timer_or_wait_fired: bool) {
     // SAFETY: see the function's SAFETY comment.
     let ctx = unsafe { &*(param as *const WaitCallbackCtx) };
 
-    // Reset before posting: a manual-reset event left signaled would just
-    // retrigger the callback the moment `wait` re-arms it.
-    // SAFETY: `ctx.handle` is valid for as long as this registration is.
-    unsafe {
-        ResetEvent(ctx.handle);
-    }
     // SAFETY: `ctx.iocp` is valid for as long as this registration is.
-    unsafe {
-        PostQueuedCompletionStatus(ctx.iocp, 0, param as usize, null_mut());
+    let posted = unsafe { PostQueuedCompletionStatus(ctx.iocp, 0, param as usize, null_mut()) };
+    if posted == 0 {
+        // The wake-up couldn't be queued, but the signal was already
+        // consumed by the wait. For a transient failure (realistically:
+        // resource exhaustion) re-signal so the persistent registration
+        // retries instead of dropping the doorbell on the floor. For a
+        // dead port (closed handle) the doorbell has no destination left,
+        // and re-signaling would just spin wait-satisfy/post-fail forever.
+        // SAFETY: reads the thread's last-error slot; `ctx.handle` is
+        // valid for as long as this registration is.
+        unsafe {
+            if GetLastError() != ERROR_INVALID_HANDLE {
+                SetEvent(ctx.handle);
+            }
+        }
     }
 }
 
@@ -230,6 +246,7 @@ impl Epoll {
     }
 
     fn add(&self, handle: HANDLE, event: EpollEvent) -> io::Result<()> {
+        debug_assert_auto_reset(handle);
         let mut registrations = self.registrations.lock().unwrap();
         if registrations.contains_key(&handle) {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists));
@@ -239,7 +256,6 @@ impl Epoll {
             iocp: self.iocp,
             handle,
             data: event.data(),
-            wait_handle: AtomicPtr::new(null_mut()),
         }));
 
         let mut wait_handle: HANDLE = null_mut();
@@ -254,7 +270,7 @@ impl Epoll {
                 Some(wait_callback),
                 ctx as *mut c_void,
                 INFINITE,
-                WT_EXECUTEONLYONCE,
+                WT_EXECUTEDEFAULT,
             )
         };
         if ret == 0 {
@@ -265,12 +281,8 @@ impl Epoll {
             }
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: `ctx` isn't reachable from any callback until this store.
-        unsafe {
-            (*ctx).wait_handle.store(wait_handle, Ordering::Release);
-        }
 
-        registrations.insert(handle, Registration { ctx });
+        registrations.insert(handle, Registration { wait_handle, ctx });
         Ok(())
     }
 
@@ -341,35 +353,7 @@ impl Epoll {
                 continue;
             };
             // SAFETY: the registration is in the map, so `ctx` is alive.
-            let ctx = unsafe { &*reg.ctx };
-            let data = ctx.data;
-
-            // Reap the spent registration and re-arm. Safe to block here: this isn't a
-            // callback thread, and the callback that posted this completion has returned.
-            let spent = ctx.wait_handle.swap(null_mut(), Ordering::AcqRel);
-            if !spent.is_null() {
-                // SAFETY: `spent` was atomically claimed above.
-                unsafe {
-                    UnregisterWaitEx(spent as HANDLE, INVALID_HANDLE_VALUE);
-                }
-            }
-            let mut new_wait_handle: HANDLE = null_mut();
-            // SAFETY: `ctx.handle` outlives its registration (the caller's
-            // contract, as on Linux), and `reg.ctx` is alive as above.
-            let ret = unsafe {
-                RegisterWaitForSingleObject(
-                    &mut new_wait_handle,
-                    ctx.handle,
-                    Some(wait_callback),
-                    reg.ctx as *mut c_void,
-                    INFINITE,
-                    WT_EXECUTEONLYONCE,
-                )
-            };
-            if ret != 0 {
-                ctx.wait_handle.store(new_wait_handle, Ordering::Release);
-            }
-            // On failure the handle stops being watched; still deliver the event below.
+            let data = unsafe { (*reg.ctx).data };
             drop(registrations);
 
             events[count] = EpollEvent::new(EventSet::IN, data);
@@ -405,27 +389,90 @@ impl Drop for Epoll {
     }
 }
 
-fn unregister(reg: Registration) -> io::Result<()> {
-    // `Epoll::wait` re-arms under the registrations lock this caller holds, so one claim
-    // suffices, but the loop stays as a guard. The blocking `UnregisterWaitEx` waits until
-    // any in-flight callback for that handle returns, so once the loop ends nothing can
-    // reference `reg.ctx`.
-    let mut result = Ok(());
-    loop {
-        // SAFETY: `reg.ctx` is valid until freed below.
-        let handle = unsafe { (*reg.ctx).wait_handle.swap(null_mut(), Ordering::AcqRel) };
-        if handle.is_null() {
-            break;
-        }
-        // SAFETY: `handle` was just atomically claimed above.
-        let ret = unsafe { UnregisterWaitEx(handle as HANDLE, INVALID_HANDLE_VALUE) };
-        if ret == 0 {
-            // Keep the first error but keep looping: a racing callback may
-            // still have re-registered a handle that needs claiming.
-            result = result.and(Err(io::Error::last_os_error()));
-        }
+/// Debug-build guard for the module's core precondition: a manual-reset
+/// event under a persistent wait fires continuously, so catch the
+/// misregistration at `ctl()` time instead of as a mystery hot spin.
+///
+/// `NtQueryEvent` lives in ntdll, which `windows-sys` does not bind; the
+/// hand-declared extern is confined to debug builds.
+#[cfg(debug_assertions)]
+fn debug_assert_auto_reset(handle: HANDLE) {
+    const EVENT_BASIC_INFORMATION_CLASS: i32 = 0;
+    const SYNCHRONIZATION_EVENT: i32 = 1; // auto-reset; 0 = NotificationEvent
+
+    #[repr(C)]
+    struct EventBasicInformation {
+        event_type: i32,
+        event_state: i32,
     }
-    // SAFETY: see the loop comment above.
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryEvent(
+            event_handle: HANDLE,
+            event_information_class: i32,
+            event_information: *mut c_void,
+            event_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32; // NTSTATUS
+    }
+
+    const STATUS_ACCESS_DENIED: i32 = 0xC0000022u32 as i32;
+
+    let mut info = EventBasicInformation {
+        event_type: SYNCHRONIZATION_EVENT,
+        event_state: 0,
+    };
+    let mut len = 0u32;
+    // SAFETY: `info` is a valid out-buffer of the stated length; the class
+    // selects EVENT_BASIC_INFORMATION.
+    let status = unsafe {
+        NtQueryEvent(
+            handle,
+            EVENT_BASIC_INFORMATION_CLASS,
+            (&mut info as *mut EventBasicInformation).cast(),
+            std::mem::size_of::<EventBasicInformation>() as u32,
+            &mut len,
+        )
+    };
+    // ACCESS_DENIED means the handle IS an event but lacks
+    // EVENT_QUERY_STATE (the type check precedes the access check, so
+    // other waitables fail with STATUS_OBJECT_TYPE_MISMATCH instead).
+    // Passing it through silently would leave this guard inert on
+    // peer-opened doorbells — the production path it exists for — so an
+    // unverifiable event is loud too. `EventFd::open` requests the right.
+    debug_assert!(
+        status != STATUS_ACCESS_DENIED,
+        "Epoll cannot verify this event's reset mode: the handle lacks \
+         EVENT_QUERY_STATE; open the event with that right included"
+    );
+    // Any other failed query means the handle is some other waitable
+    // (semaphore, process, ...), which is allowed; only a confirmed
+    // manual-reset event is a misuse of this Epoll.
+    debug_assert!(
+        status != 0 || info.event_type == SYNCHRONIZATION_EVENT,
+        "Epoll requires auto-reset events; a manual-reset event stays \
+         signaled and would fire its persistent wait continuously"
+    );
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_assert_auto_reset(_handle: HANDLE) {}
+
+fn unregister(reg: Registration) -> io::Result<()> {
+    // The blocking form of `UnregisterWaitEx` cancels the persistent wait
+    // and waits until any in-flight callback returns, so after it nothing
+    // can reference `reg.ctx`.
+    // SAFETY: `reg.wait_handle` was produced by RegisterWaitForSingleObject
+    // and is unregistered exactly once (the Registration is owned here).
+    let ret = unsafe { UnregisterWaitEx(reg.wait_handle, INVALID_HANDLE_VALUE) };
+    let result = if ret == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    // SAFETY: see the comment above; on failure we still own the Box and
+    // leaking the wait registration is the kernel's problem, not a reason
+    // to leak the context too.
     unsafe {
         drop(Box::from_raw(reg.ctx));
     }
@@ -442,8 +489,9 @@ mod tests {
     #[test]
     fn test_consume_after_epoll_wait_does_not_deadlock() {
         // Regression test for the vhost-user-backend kick pattern: signal,
-        // Epoll::wait (which resets the handle), then consume via an
-        // EventConsumer built from the same handle. Must not block.
+        // Epoll::wait (whose wait registration consumes the auto-reset
+        // signal), then consume via an EventConsumer built from the same
+        // handle. Must not block.
         const TIMEOUT: i32 = 5000;
 
         let epoll = Epoll::new().unwrap();
@@ -572,6 +620,169 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "auto-reset")]
+    fn registering_a_manual_reset_event_is_caught_in_debug_builds() {
+        // The module's core precondition, enforced at ctl() time: a
+        // manual-reset event under a persistent wait would hot-spin.
+        use windows_sys::Win32::System::Threading::CreateEventA;
+        // SAFETY: plain create; checked before use.
+        let manual = unsafe { CreateEventA(std::ptr::null(), 1, 0, std::ptr::null()) };
+        assert!(!manual.is_null());
+        let epoll = Epoll::new().unwrap();
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            manual as RawHandle,
+            EpollEvent::new(EventSet::IN, 0),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "EVENT_QUERY_STATE")]
+    fn an_event_opened_without_query_rights_is_loud_not_silently_unverified() {
+        // Empirically pins the NtQueryEvent access requirement (it's
+        // undocumented): without EVENT_QUERY_STATE the query fails with
+        // ACCESS_DENIED, and the guard must refuse to pass that through —
+        // otherwise it is inert on exactly the peer-opened production path.
+        use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+        use windows_sys::Win32::System::Threading::{CreateEventA, OpenEventA, EVENT_MODIFY_STATE};
+        let name = std::ffi::CString::new(format!(
+            "vmm-sys-util-epoll-query-test-{}",
+            std::process::id()
+        ))
+        .unwrap();
+        // SAFETY: valid name; checked before use. Auto-reset, so only the
+        // rights — not the mode — can trip the guard.
+        let created = unsafe { CreateEventA(std::ptr::null(), 0, 0, name.as_ptr().cast()) };
+        assert!(!created.is_null());
+        // SAFETY: reopening the event just created, with a restricted mask.
+        let narrow =
+            unsafe { OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, 0, name.as_ptr().cast()) };
+        assert!(!narrow.is_null());
+
+        let epoll = Epoll::new().unwrap();
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            narrow as RawHandle,
+            EpollEvent::new(EventSet::IN, 0),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "auto-reset")]
+    fn a_peer_opened_manual_reset_event_is_caught_in_debug_builds() {
+        // The end-to-end production shape: a peer mints a manual-reset
+        // event (contract violation), this side opens it by name with
+        // EventFd::open — whose mask includes EVENT_QUERY_STATE precisely
+        // so this guard can see the mode — and registration must panic.
+        use windows_sys::Win32::System::Threading::CreateEventA;
+        let name = std::ffi::CString::new(format!(
+            "vmm-sys-util-epoll-manual-test-{}",
+            std::process::id()
+        ))
+        .unwrap();
+        // SAFETY: valid name; checked before use. Manual-reset on purpose.
+        let created = unsafe { CreateEventA(std::ptr::null(), 1, 0, name.as_ptr().cast()) };
+        assert!(!created.is_null());
+
+        let opened = EventFd::open(name.to_str().unwrap()).unwrap();
+        let epoll = Epoll::new().unwrap();
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            opened.as_raw_handle(),
+            EpollEvent::new(EventSet::IN, 0),
+        );
+    }
+
+    #[test]
+    fn a_restricted_rights_semaphore_is_still_registrable() {
+        // Pins the second undocumented kernel behavior the debug guard
+        // rests on: the object TYPE check precedes the ACCESS check, so a
+        // non-event waitable held with restricted rights fails NtQueryEvent
+        // with STATUS_OBJECT_TYPE_MISMATCH (allowed) rather than
+        // STATUS_ACCESS_DENIED (loud). If the ordering were the other way,
+        // this registration would panic in debug builds.
+        use windows_sys::Win32::Foundation::DuplicateHandle;
+        use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+        use windows_sys::Win32::System::Threading::{
+            CreateSemaphoreA, GetCurrentProcess, SEMAPHORE_MODIFY_STATE,
+        };
+        // SAFETY: plain create (count 0 = unsignaled); checked before use.
+        let sem = unsafe { CreateSemaphoreA(std::ptr::null(), 0, 1, std::ptr::null()) };
+        assert!(!sem.is_null());
+        // Narrow the rights the way a peer-opened handle would be narrowed.
+        let mut narrow: HANDLE = null_mut();
+        // SAFETY: valid source handle and pseudo process handles; `narrow`
+        // is a valid out-pointer. Explicit mask, not DUPLICATE_SAME_ACCESS.
+        let ok = unsafe {
+            let process = GetCurrentProcess();
+            DuplicateHandle(
+                process,
+                sem,
+                process,
+                &mut narrow,
+                SEMAPHORE_MODIFY_STATE | SYNCHRONIZE,
+                0,
+                0,
+            )
+        };
+        assert_ne!(ok, 0);
+
+        let epoll = Epoll::new().unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                narrow as RawHandle,
+                EpollEvent::new(EventSet::IN, 0),
+            )
+            .expect("a restricted-rights non-event waitable must register");
+        epoll
+            .ctl(
+                ControlOperation::Delete,
+                narrow as RawHandle,
+                EpollEvent::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn each_signal_delivers_exactly_one_wakeup_and_no_storm() {
+        // Two writes: exactly two wake-ups, then silence. A manual-reset
+        // event under a persistent wait would storm (stay signaled and
+        // fire continuously); a lost signal would deliver fewer.
+        let epoll = Epoll::new().unwrap();
+        let event_fd = EventFd::new(0).unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                event_fd.as_raw_handle(),
+                EpollEvent::new(EventSet::IN, 9),
+            )
+            .unwrap();
+
+        event_fd.write(1).unwrap();
+        event_fd.write(1).unwrap();
+
+        let mut ready = [EpollEvent::default(); 8];
+        let mut total = 0;
+        while total < 2 {
+            let n = epoll.wait(5000, &mut ready[..]).unwrap();
+            assert_ne!(n, 0, "wake-up lost: got {total} of 2");
+            total += n;
+        }
+        assert_eq!(total, 2);
+        // Silence afterwards: nothing left signaled, nothing re-firing.
+        assert_eq!(epoll.wait(100, &mut ready[..]).unwrap(), 0);
+
+        epoll
+            .ctl(
+                ControlOperation::Delete,
+                event_fd.as_raw_handle(),
+                EpollEvent::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn test_epoll_wait_timeout() {
         let epoll = Epoll::new().unwrap();
         let mut ready = [EpollEvent::default(); 8];
@@ -618,8 +829,9 @@ mod tests {
     }
 
     #[test]
-    fn a_thousand_fire_and_rearm_cycles_leak_no_handles() {
-        // A spent wait registration abandoned per fire shows up as +N here.
+    fn a_thousand_fire_cycles_leak_no_handles() {
+        // The registration is persistent, so N fires must not create (or
+        // leak) N of anything: no wait-handle churn, no context churn.
         // Delta over N, not exact equality: other test threads add handle noise.
         const N: u32 = 1000;
         let epoll = Epoll::new().unwrap();

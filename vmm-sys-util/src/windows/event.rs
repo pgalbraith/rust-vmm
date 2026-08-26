@@ -68,13 +68,16 @@ pub struct EventConsumer {
 }
 
 impl EventConsumer {
-    /// Consume a pending signal, if any.
+    /// Consume a pending signal.
     ///
-    /// Unlike Linux, this does not block: [`crate::epoll::Epoll`] resets the
-    /// handle itself when reporting it ready, so this isn't usable as a
-    /// standalone "block until signaled" primitive on Windows.
+    /// On Windows this is a no-op that always returns `Ok(())`. The event
+    /// is auto-reset, so the signal was already consumed atomically by
+    /// whatever wait it satisfied — normally the [`crate::epoll::Epoll`]
+    /// registration that reported readiness. Touching the handle here (even
+    /// a zero-timeout wait) could eat a *new* signal racing in between that
+    /// wake-up and this call, silently losing a doorbell.
     pub fn consume(&self) -> result::Result<(), io::Error> {
-        self.event.try_consume()
+        Ok(())
     }
 
     /// Clone this EventConsumer.
@@ -105,8 +108,13 @@ impl IntoRawHandle for EventConsumer {
     }
 }
 
-/// Create a new EventNotifier and EventConsumer, backed by a single named
-/// event object duplicated into two independent handles.
+/// Create a new EventNotifier and EventConsumer, backed by a single
+/// auto-reset event object duplicated into two independent handles.
+///
+/// Auto-reset means one [`EventNotifier::notify`] wakes exactly **one**
+/// waiter. Do not share one consumer/notifier pair across threads as a
+/// broadcast — give each thread its own pair, or all but one thread will
+/// keep sleeping through the signal.
 ///
 /// # Arguments
 ///
