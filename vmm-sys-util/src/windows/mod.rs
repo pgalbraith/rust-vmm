@@ -3,6 +3,7 @@
 pub mod epoll;
 pub mod event;
 pub mod eventfd;
+pub(crate) mod named_object;
 pub mod section;
 
 /// This process's kernel handle count, for leak-detection tests: a

@@ -9,9 +9,20 @@
   (`EventConsumer`/`EventNotifier`), bound through `windows-sys`.
 - Windows `section::Section`: a named, pagefile-backed section object,
   complementing `vm-memory`'s `MmapRegion::from_section`.
-- Windows `EventFd::new_shareable()`: creates the event under a retained,
-  process-unique name (`EventFd::name()`) for handing to a peer. Plain
-  `EventFd::new()` is anonymous again.
+- Windows `EventFd::new_shareable()`: creates the event under a retained
+  name (`EventFd::name()`) for handing to a peer. Plain `EventFd::new()`
+  is anonymous again.
+
+### Security
+
+- Windows named objects (`EventFd::new_shareable`, `Section::new`) now
+  mint their names from 128 CSPRNG bits instead of pid-plus-counter,
+  carry a DACL admitting only the creating user instead of the token's
+  default, and fail on `ERROR_ALREADY_EXISTS` instead of silently
+  adopting a squatter's pre-created object.
+- Windows `Section::open` requests read/write mapping access instead of
+  `FILE_MAP_ALL_ACCESS`, so a peer-held handle can no longer resize the
+  section or rewrite its security descriptor.
 
 ### Fixed
 

@@ -55,6 +55,8 @@ const MM_HIGHEST_VAD_ADDRESS: u64 = 0x000007FFFFFDFFFF;
 const MEM_COMMIT: u32 = 0x00001000;
 const MEM_RELEASE: u32 = 0x00008000;
 const FILE_MAP_ALL_ACCESS: u32 = 0xf001f;
+const FILE_MAP_WRITE: u32 = 0x2;
+const FILE_MAP_READ: u32 = 0x4;
 const PAGE_READWRITE: u32 = 0x04;
 
 pub const MAP_FAILED: *mut c_void = null_mut::<c_void>();
@@ -202,10 +204,13 @@ impl<B: NewBitmap> MmapRegion<B> {
         // the section, so an out-of-range request becomes an error below rather than an out-of-bounds
         // view. The section's own size is not queryable before mapping, so this is the bounds check.
         // The section already is the mapping object, so unlike `from_file` there's nothing to create.
+        // Read/write view access only: it's all a guest-memory view needs, and a peer-opened
+        // section handle (`Section::open`) carries exactly that much — requesting
+        // FILE_MAP_ALL_ACCESS against one would fail with access denied.
         let addr = unsafe {
             MapViewOfFile(
                 handle,
-                FILE_MAP_ALL_ACCESS,
+                FILE_MAP_READ | FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
                 size,

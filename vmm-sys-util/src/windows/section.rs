@@ -15,21 +15,40 @@
 use std::ffi::CString;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, RawHandle};
-use std::process;
-use std::ptr::null;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingA, OpenFileMappingA, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
+    CreateFileMappingA, OpenFileMappingA, FILE_MAP_READ, FILE_MAP_WRITE, PAGE_READWRITE,
 };
 
-static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+use crate::windows::named_object;
 
 fn unique_name() -> CString {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: the formatted string contains no interior NUL byte.
-    CString::new(format!("vmm-sys-util-sec-{}-{}", process::id(), id)).unwrap()
+    named_object::unique_name("vmm-sys-util-sec-")
+}
+
+/// Create a pagefile-backed section under `name` with a creator-only DACL,
+/// failing (rather than adopting the impostor) if the name is taken.
+fn create_named_section(name: &CString, size: u64) -> io::Result<HANDLE> {
+    let sa = named_object::creator_only_attributes()?;
+    // SAFETY: `sa` and `name` are valid for the duration of the call; the
+    // return value is checked.
+    let handle = unsafe {
+        CreateFileMappingA(
+            INVALID_HANDLE_VALUE,
+            &sa,
+            PAGE_READWRITE,
+            (size >> 32) as u32,
+            size as u32,
+            name.as_ptr().cast(),
+        )
+    };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // Nothing between the create and this check can clobber the
+    // thread's last-error slot.
+    named_object::reject_preexisting(handle)
 }
 
 /// A named, pagefile-backed section object of a fixed size.
@@ -49,24 +68,14 @@ unsafe impl Sync for Section {}
 
 impl Section {
     /// Create a new pagefile-backed section of `size` bytes under a
-    /// freshly minted, process-unique name.
+    /// freshly minted, unguessable name.
+    ///
+    /// The name is 128 random bits, the object's DACL admits only the
+    /// creating user, and creation fails if the name is somehow already
+    /// taken instead of silently adopting the existing object.
     pub fn new(size: u64) -> io::Result<Section> {
         let name = unique_name();
-        // SAFETY: `name` is a valid NUL-terminated string for the
-        // duration of the call; the return value is checked.
-        let handle = unsafe {
-            CreateFileMappingA(
-                INVALID_HANDLE_VALUE,
-                null(),
-                PAGE_READWRITE,
-                (size >> 32) as u32,
-                size as u32,
-                name.as_ptr().cast(),
-            )
-        };
-        if handle.is_null() {
-            return Err(io::Error::last_os_error());
-        }
+        let handle = create_named_section(&name, size)?;
         Ok(Section {
             handle,
             name: Some(name),
@@ -75,11 +84,16 @@ impl Section {
 
     /// Open an existing named section created by a peer process, with
     /// the name communicated out of band.
+    ///
+    /// The handle carries read/write mapping access only — enough for
+    /// `MmapRegion::from_section`, and nothing beyond it (no
+    /// `SECTION_EXTEND_SIZE`, no `WRITE_DAC`).
     pub fn open(name: &str) -> io::Result<Section> {
         let cname = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: `cname` is a valid NUL-terminated string for the
         // duration of the call; the return value is checked.
-        let handle = unsafe { OpenFileMappingA(FILE_MAP_ALL_ACCESS, 0, cname.as_ptr().cast()) };
+        let handle =
+            unsafe { OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, 0, cname.as_ptr().cast()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -142,7 +156,13 @@ mod tests {
         // SAFETY: the handle is a valid section for the lifetime of `s`,
         // and the view is unmapped before returning.
         unsafe {
-            let view = MapViewOfFile(s.as_raw_handle() as HANDLE, FILE_MAP_ALL_ACCESS, 0, 0, size);
+            let view = MapViewOfFile(
+                s.as_raw_handle() as HANDLE,
+                FILE_MAP_READ | FILE_MAP_WRITE,
+                0,
+                0,
+                size,
+            );
             assert!(!view.Value.is_null());
             let r = f(view.Value as *mut u8);
             UnmapViewOfFile(view);
@@ -171,6 +191,20 @@ mod tests {
             unsafe { p.read() }
         });
         assert_eq!(seen, 0xA5);
+    }
+
+    #[test]
+    fn creating_over_a_squatted_name_fails_instead_of_adopting_it() {
+        // Windows reports a name collision as success + ERROR_ALREADY_EXISTS,
+        // returning the squatter's object — which here would mean treating
+        // an attacker's memory as guest RAM. The create path must refuse it.
+        let squatter = unique_name();
+        let first = create_named_section(&squatter, 0x1000).unwrap();
+        // SAFETY: `first` was just created successfully above.
+        let _first = unsafe { Section::from_raw_handle(first as RawHandle) };
+
+        let err = create_named_section(&squatter, 0x1000).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
 
     #[test]

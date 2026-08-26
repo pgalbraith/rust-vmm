@@ -5,6 +5,9 @@
 ### Changed
 
 - Windows bindings now come from `windows-sys` instead of `winapi`.
+- Windows `MmapRegion::from_section` maps its view with read/write access
+  instead of `FILE_MAP_ALL_ACCESS`, matching the least-access section
+  handles `vmm-sys-util`'s `Section::open` now returns.
 
 ### Fixed
 

@@ -9,17 +9,15 @@
 //! enough for doorbell use, the only way eventfd is used in rust-vmm.
 //!
 //! [`EventFd::new`] creates an anonymous event. [`EventFd::new_shareable`]
-//! mints a process-unique name instead, for a peer to open via
+//! mints an unguessable name instead, for a peer to open via
 //! [`EventFd::open`] once it's passed out of band — a Win32 object can only
 //! be named at creation, and most events never cross a process boundary.
 
 use std::ffi::CString;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, RawHandle};
-use std::process;
 use std::ptr::{null, null_mut};
 use std::result;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
@@ -31,6 +29,8 @@ use windows_sys::Win32::System::Threading::{
     EVENT_MODIFY_STATE, INFINITE,
 };
 
+use crate::windows::named_object;
+
 // Reexported for #[cfg]-free callers. Only EFD_NONBLOCK has any effect;
 // EFD_SEMAPHORE/EFD_CLOEXEC have no Win32 equivalent and are ignored.
 /// Mirrors Linux's `EFD_NONBLOCK`, honored by [`EventFd`].
@@ -40,12 +40,23 @@ pub const EFD_CLOEXEC: i32 = 1 << 1;
 /// Mirrors Linux's `EFD_SEMAPHORE`; no effect on Windows (no counter).
 pub const EFD_SEMAPHORE: i32 = 1 << 2;
 
-static NEXT_ID: AtomicU32 = AtomicU32::new(0);
-
 fn unique_name() -> CString {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: formatted string has no interior NUL.
-    CString::new(format!("vmm-sys-util-evt-{}-{}", process::id(), id)).unwrap()
+    named_object::unique_name("vmm-sys-util-evt-")
+}
+
+/// Create a manual-reset event under `name` with a creator-only DACL,
+/// failing (rather than adopting the impostor) if the name is taken.
+fn create_named_event(name: &CString) -> io::Result<HANDLE> {
+    let sa = named_object::creator_only_attributes()?;
+    // SAFETY: `sa` and `name` are valid for the duration of the call; the
+    // return value is checked.
+    let handle = unsafe { CreateEventA(&sa, 1, 0, name.as_ptr().cast()) };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // Nothing between the create and this check can clobber the
+    // thread's last-error slot.
+    named_object::reject_preexisting(handle)
 }
 
 /// A safe wrapper around a named, manual-reset Win32 event object, used as
@@ -86,19 +97,19 @@ impl EventFd {
         })
     }
 
-    /// Create a new `EventFd` under a freshly minted, process-unique name,
-    /// for handing to another process (see the module docs).
+    /// Create a new `EventFd` under a freshly minted, unguessable name, for
+    /// handing to another process (see the module docs).
+    ///
+    /// The name is 128 random bits, the object's DACL admits only the
+    /// creating user, and creation fails if the name is somehow already
+    /// taken instead of silently adopting the existing object.
     ///
     /// # Arguments
     ///
     /// * `flag`: only [`EFD_NONBLOCK`] has any effect; see the module docs.
     pub fn new_shareable(flag: i32) -> result::Result<EventFd, io::Error> {
         let name = unique_name();
-        // SAFETY: `name` is a valid NUL-terminated C string outliving the call.
-        let handle = unsafe { CreateEventA(null(), 1, 0, name.as_ptr().cast()) };
-        if handle.is_null() {
-            return Err(io::Error::last_os_error());
-        }
+        let handle = create_named_event(&name)?;
         Ok(EventFd {
             event: handle,
             nonblock: flag & EFD_NONBLOCK != 0,
@@ -343,6 +354,19 @@ mod tests {
         let opened = EventFd::open(name).unwrap();
         evt.write(1).unwrap();
         assert_eq!(opened.read().unwrap(), 1);
+    }
+
+    #[test]
+    fn creating_over_a_squatted_name_fails_instead_of_adopting_it() {
+        // Windows reports a name collision as success + ERROR_ALREADY_EXISTS,
+        // returning the squatter's object. The create path must refuse it.
+        let squatter = unique_name();
+        let first = create_named_event(&squatter).unwrap();
+        // SAFETY: `first` was just created successfully above.
+        let _first = unsafe { EventFd::from_raw_handle(first as RawHandle) };
+
+        let err = create_named_event(&squatter).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
 
     #[test]
