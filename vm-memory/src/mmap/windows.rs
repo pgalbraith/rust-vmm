@@ -6,60 +6,27 @@
 use std;
 use std::io;
 use std::os::windows::io::{AsRawHandle, RawHandle};
-use std::ptr::{null, null_mut};
+use std::ptr::null;
 
-use libc::{c_void, size_t};
-
-use windows_sys::Win32::Foundation::GetLastError;
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingA, MapViewOfFile, UnmapViewOfFile, VirtualAlloc, VirtualFree,
+    FILE_MAP_ALL_ACCESS, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MEM_COMMIT,
+    MEM_RELEASE, PAGE_READWRITE,
+};
 
 use crate::bitmap::{Bitmap, NewBitmap, BS};
 use crate::guest_memory::FileOffset;
 use crate::volatile_memory::{self, compute_offset, VolatileMemory, VolatileSlice};
 
-#[allow(non_snake_case)]
-#[link(name = "kernel32")]
-extern "system" {
-    pub fn VirtualAlloc(
-        lpAddress: *mut c_void,
-        dwSize: size_t,
-        flAllocationType: u32,
-        flProtect: u32,
-    ) -> *mut c_void;
-
-    pub fn VirtualFree(lpAddress: *mut c_void, dwSize: size_t, dwFreeType: u32) -> u32;
-
-    pub fn CreateFileMappingA(
-        hFile: RawHandle,                       // HANDLE
-        lpFileMappingAttributes: *const c_void, // LPSECURITY_ATTRIBUTES
-        flProtect: u32,                         // DWORD
-        dwMaximumSizeHigh: u32,                 // DWORD
-        dwMaximumSizeLow: u32,                  // DWORD
-        lpName: *const u8,                      // LPCSTR
-    ) -> RawHandle; // HANDLE
-
-    pub fn MapViewOfFile(
-        hFileMappingObject: RawHandle,
-        dwDesiredAccess: u32,
-        dwFileOffsetHigh: u32,
-        dwFileOffsetLow: u32,
-        dwNumberOfBytesToMap: size_t,
-    ) -> *mut c_void;
-
-    pub fn UnmapViewOfFile(lpBaseAddress: *const c_void) -> u32; // BOOL
-
-    pub fn CloseHandle(hObject: RawHandle) -> u32; // BOOL
-}
+// The Win32 bindings come from windows-sys rather than a hand-declared
+// extern block: the hand-rolled signatures typed MapViewOfFile's return
+// and UnmapViewOfFile's argument as bare pointers where the real ABI uses
+// MEMORY_MAPPED_VIEW_ADDRESS (a repr(C) newtype over the pointer), which
+// only worked by coincidence of the x64 calling convention.
 
 const MM_HIGHEST_VAD_ADDRESS: u64 = 0x000007FFFFFDFFFF;
 
-const MEM_COMMIT: u32 = 0x00001000;
-const MEM_RELEASE: u32 = 0x00008000;
-const FILE_MAP_ALL_ACCESS: u32 = 0xf001f;
-const FILE_MAP_WRITE: u32 = 0x2;
-const FILE_MAP_READ: u32 = 0x4;
-const PAGE_READWRITE: u32 = 0x04;
-
-pub const MAP_FAILED: *mut c_void = null_mut::<c_void>();
 pub const INVALID_HANDLE_VALUE: RawHandle = (-1isize) as RawHandle;
 #[allow(dead_code)]
 pub const ERROR_INVALID_PARAMETER: i32 = 87;
@@ -102,8 +69,8 @@ impl<B: NewBitmap> MmapRegion<B> {
         }
         // This is safe because we are creating an anonymous mapping in a place not already used by
         // any other area in this process.
-        let addr = unsafe { VirtualAlloc(null_mut::<c_void>(), size, MEM_COMMIT, PAGE_READWRITE) };
-        if addr == MAP_FAILED {
+        let addr = unsafe { VirtualAlloc(null(), size, MEM_COMMIT, PAGE_READWRITE) };
+        if addr.is_null() {
             return Err(io::Error::last_os_error());
         }
         Ok(Self {
@@ -137,7 +104,7 @@ impl<B: NewBitmap> MmapRegion<B> {
                 null(),
             )
         };
-        if mapping == 0 as RawHandle {
+        if mapping.is_null() {
             return Err(io::Error::last_os_error());
         }
 
@@ -145,7 +112,7 @@ impl<B: NewBitmap> MmapRegion<B> {
 
         // This is safe because we are creating a mapping in a place not already used by any other
         // area in this process.
-        let addr = unsafe {
+        let view = unsafe {
             MapViewOfFile(
                 mapping,
                 FILE_MAP_ALL_ACCESS,
@@ -159,11 +126,11 @@ impl<B: NewBitmap> MmapRegion<B> {
             CloseHandle(mapping);
         }
 
-        if addr.is_null() {
+        if view.Value.is_null() {
             return Err(io::Error::last_os_error());
         }
         Ok(Self {
-            addr: addr as *mut u8,
+            addr: view.Value as *mut u8,
             size,
             bitmap: B::with_len(size),
             file_offset: Some(file_offset),
@@ -233,14 +200,14 @@ impl<B: NewBitmap> MmapRegion<B> {
         // `access` is read/write or read-only, never FILE_MAP_ALL_ACCESS: a view needs nothing
         // more, and a peer-opened section handle (`Section::open`/`open_read_only`) doesn't
         // carry more — requesting FILE_MAP_ALL_ACCESS against one fails with access denied.
-        let addr =
+        let view =
             unsafe { MapViewOfFile(handle, access, (offset >> 32) as u32, offset as u32, size) };
-        if addr.is_null() {
+        if view.Value.is_null() {
             return Err(io::Error::last_os_error());
         }
 
         Ok(Self {
-            addr: addr as *mut u8,
+            addr: view.Value as *mut u8,
             size,
             bitmap: B::with_len(size),
             // Deliberately `None`: not file-backed, so a fabricated `FileOffset` would mislead.
@@ -313,9 +280,11 @@ impl<B> Drop for MmapRegion<B> {
         // (size 0 for MEM_RELEASE). Each fails with ERROR_INVALID_PARAMETER on the other's memory.
         unsafe {
             let ret_val = if self.mapped_view {
-                UnmapViewOfFile(self.addr as *const libc::c_void)
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.addr.cast(),
+                })
             } else {
-                VirtualFree(self.addr as *mut libc::c_void, 0, MEM_RELEASE)
+                VirtualFree(self.addr.cast(), 0, MEM_RELEASE)
             };
             if ret_val == 0 {
                 let err = GetLastError();

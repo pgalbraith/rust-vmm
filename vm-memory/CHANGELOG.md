@@ -5,6 +5,11 @@
 ### Changed
 
 - Windows bindings now come from `windows-sys` instead of `winapi`.
+- The Windows mmap module's Win32 bindings come from `windows-sys`
+  instead of a hand-declared `extern` block whose `MapViewOfFile` /
+  `UnmapViewOfFile` signatures typed the view address as a bare pointer
+  where the real ABI uses `MEMORY_MAPPED_VIEW_ADDRESS` — correct on
+  x64 only by coincidence of the calling convention.
 - Windows `MmapRegion::from_section` maps its view with read/write access
   instead of `FILE_MAP_ALL_ACCESS`, matching the least-access section
   handles `vmm-sys-util`'s `Section::open` now returns.
