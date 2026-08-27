@@ -49,6 +49,11 @@
   already consumed by the wait that reported readiness, and even a
   zero-timeout wait here could eat the next signal before `Epoll`
   delivers it.
+- Windows `EventFd::into_raw_handle` and `Section::into_raw_handle`
+  leaked the object's retained name on every call: `mem::forget`
+  suppressed the name's drop along with the handle's. Guarded by new
+  allocation-delta leak tests (the handle-count tests were blind to a
+  memory leak).
 
 ### Changed
 

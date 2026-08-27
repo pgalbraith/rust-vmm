@@ -143,9 +143,12 @@ impl FromRawHandle for Section {
 
 impl IntoRawHandle for Section {
     fn into_raw_handle(self) -> RawHandle {
-        let handle = self.handle as RawHandle;
-        std::mem::forget(self);
-        handle
+        // Suppress `Drop` (which would close the handle) without leaking
+        // the rest of the struct: a bare `mem::forget` also leaked the
+        // name's heap allocation, once per call.
+        let mut this = std::mem::ManuallyDrop::new(self);
+        drop(this.name.take());
+        this.handle as RawHandle
     }
 }
 
@@ -256,6 +259,27 @@ mod tests {
         // SAFETY: the handle comes straight from into_raw_handle.
         let adopted = unsafe { Section::from_raw_handle(created.into_raw_handle()) };
         assert!(adopted.name().is_none());
+    }
+
+    #[test]
+    fn a_thousand_into_raw_handle_cycles_leak_no_name_bytes() {
+        // See the eventfd twin: mem::forget in into_raw_handle leaked the
+        // name's CString, invisible to the handle-count tests.
+        const N: isize = 2000;
+        let before = crate::windows::allocated_bytes();
+        for _ in 0..N {
+            let s = Section::new(0x1000).unwrap();
+            let h = s.into_raw_handle();
+            // SAFETY: `h` came from into_raw_handle and is closed exactly
+            // once, keeping the handle count flat.
+            unsafe { CloseHandle(h as HANDLE) };
+        }
+        let after = crate::windows::allocated_bytes();
+        assert!(
+            after - before < N * 25,
+            "net allocation grew {} bytes over {N} cycles",
+            after - before
+        );
     }
 
     #[test]
