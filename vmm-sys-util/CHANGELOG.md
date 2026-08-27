@@ -49,6 +49,12 @@
   already consumed by the wait that reported readiness, and even a
   zero-timeout wait here could eat the next signal before `Epoll`
   delivers it.
+- Windows named objects are created and opened through the wide (`W`)
+  entry points instead of the ANSI (`A`) ones, which convert names
+  through the machine-configurable process code page — a non-ASCII
+  name could resolve differently on each side of a process boundary.
+  Names minted by `EventFd::new_shareable` and `Section::new` now
+  carry an explicit `Local\` (session-local) namespace prefix.
 - Windows `Epoll` completions are keyed by a monotonically increasing
   token instead of the registration's heap address: an address could be
   reused by a later registration, letting a completion queued for a

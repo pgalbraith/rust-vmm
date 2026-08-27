@@ -5,6 +5,9 @@
 ### Changed
 
 - Windows bindings now come from `windows-sys` instead of `winapi`.
+- Windows `MmapRegion::from_file` creates its (unnamed) mapping with
+  `CreateFileMappingW`, retiring the last ANSI entry point in the
+  crate.
 - The Windows mmap module's Win32 bindings come from `windows-sys`
   instead of a hand-declared `extern` block whose `MapViewOfFile` /
   `UnmapViewOfFile` signatures typed the view address as a bare pointer

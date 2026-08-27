@@ -19,7 +19,7 @@
 //! must be created auto-reset by its minting process; an event this side
 //! only ever signals ([`EventFd::write`]) works either way — `SetEvent`
 //! is mode-agnostic. A creator cannot *prove* it got auto-reset —
-//! `CreateEventA` over an existing name silently ignores `bManualReset`
+//! `CreateEventW` over an existing name silently ignores `bManualReset`
 //! and returns the existing object — which is why creation here fails on
 //! `ERROR_ALREADY_EXISTS` instead of proceeding with an object whose
 //! semantics someone else chose.
@@ -29,7 +29,6 @@
 //! [`EventFd::open`] once it's passed out of band — a Win32 object can only
 //! be named at creation, and most events never cross a process boundary.
 
-use std::ffi::CString;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, RawHandle};
 use std::ptr::{null, null_mut};
@@ -41,7 +40,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Threading::{
-    CreateEventA, GetCurrentProcess, OpenEventA, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
+    CreateEventW, GetCurrentProcess, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
     INFINITE,
 };
 
@@ -56,17 +55,18 @@ pub const EFD_CLOEXEC: i32 = 1 << 1;
 /// Mirrors Linux's `EFD_SEMAPHORE`; no effect on Windows (no counter).
 pub const EFD_SEMAPHORE: i32 = 1 << 2;
 
-fn unique_name() -> CString {
+fn unique_name() -> String {
     named_object::unique_name("vmm-sys-util-evt-")
 }
 
 /// Create an auto-reset event under `name` with a creator-only DACL,
 /// failing (rather than adopting the impostor) if the name is taken.
-fn create_named_event(name: &CString) -> io::Result<HANDLE> {
+fn create_named_event(name: &str) -> io::Result<HANDLE> {
     let sa = named_object::creator_only_attributes()?;
-    // SAFETY: `sa` and `name` are valid for the duration of the call; the
+    let wide = named_object::to_wide_name(name)?;
+    // SAFETY: `sa` and `wide` are valid for the duration of the call; the
     // return value is checked.
-    let handle = unsafe { CreateEventA(&sa, 0, 0, name.as_ptr().cast()) };
+    let handle = unsafe { CreateEventW(&sa, 0, 0, wide.as_ptr()) };
     if handle.is_null() {
         return Err(io::Error::last_os_error());
     }
@@ -83,7 +83,7 @@ pub struct EventFd {
     nonblock: bool,
     /// The object's name; `None` when the event arrived as a bare handle
     /// ([`FromRawHandle`]) and its name is unknown.
-    name: Option<CString>,
+    name: Option<String>,
 }
 
 // SAFETY: a Win32 HANDLE has no thread affinity.
@@ -102,7 +102,7 @@ impl EventFd {
     pub fn new(flag: i32) -> result::Result<EventFd, io::Error> {
         // SAFETY: all arguments are simple values; the return value is
         // checked for failure.
-        let handle = unsafe { CreateEventA(null(), 0, 0, std::ptr::null()) };
+        let handle = unsafe { CreateEventW(null(), 0, 0, std::ptr::null()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -139,9 +139,7 @@ impl EventFd {
     /// [`open`](EventFd::open) — an anonymous or bare-handle event has
     /// none to give.
     pub fn name(&self) -> Option<&str> {
-        // The name was built from (or validated as) a Rust string, so
-        // it converts back losslessly.
-        self.name.as_ref().and_then(|n| n.to_str().ok())
+        self.name.as_deref()
     }
 
     /// Open an existing named event object created by a peer process (e.g.
@@ -163,13 +161,13 @@ impl EventFd {
     pub fn open(name: &str, flag: i32) -> result::Result<EventFd, io::Error> {
         // Not exposed outside windows-sys's Wdk tree; the value is fixed.
         const EVENT_QUERY_STATE: u32 = 0x0001;
-        let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        // SAFETY: `name` is a valid NUL-terminated C string outliving the call.
+        let wide = named_object::to_wide_name(name)?;
+        // SAFETY: `wide` is a valid NUL-terminated wide string outliving the call.
         let handle = unsafe {
-            OpenEventA(
+            OpenEventW(
                 EVENT_MODIFY_STATE | EVENT_QUERY_STATE | SYNCHRONIZE,
                 0,
-                name.as_ptr().cast(),
+                wide.as_ptr(),
             )
         };
         if handle.is_null() {
@@ -178,7 +176,7 @@ impl EventFd {
         Ok(EventFd {
             event: handle,
             nonblock: flag & EFD_NONBLOCK != 0,
-            name: Some(name),
+            name: Some(name.to_string()),
         })
     }
 
@@ -370,16 +368,10 @@ mod tests {
 
     #[test]
     fn test_open_by_name() {
-        let name = unique_name().into_string().unwrap();
-        // SAFETY: name is a valid C string with no interior NUL.
-        let handle = unsafe {
-            CreateEventA(
-                null(),
-                0,
-                0,
-                CString::new(name.clone()).unwrap().as_ptr().cast(),
-            )
-        };
+        let name = unique_name();
+        let wide = named_object::to_wide_name(&name).unwrap();
+        // SAFETY: `wide` is a valid NUL-terminated wide string.
+        let handle = unsafe { CreateEventW(null(), 0, 0, wide.as_ptr()) };
         assert!(!handle.is_null());
         // SAFETY: handle was just created successfully above.
         let created = unsafe { EventFd::from_raw_handle(handle as RawHandle) };
@@ -400,7 +392,7 @@ mod tests {
         // its name; without retention nothing could be transmitted.
         let evt = EventFd::new_shareable(0).unwrap();
         let name = evt.name().expect("a shareable EventFd must know its name");
-        assert!(name.starts_with("vmm-sys-util-evt-"));
+        assert!(name.starts_with("Local\\vmm-sys-util-evt-"));
 
         let opened = EventFd::open(name, 0).unwrap();
         evt.write(1).unwrap();
@@ -418,6 +410,28 @@ mod tests {
 
         let err = create_named_event(&squatter).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_non_ascii_name_round_trips() {
+        // The point of the W entry points: the A variants convert names
+        // through the process ANSI code page, so a name outside it could
+        // resolve differently on each side of the process boundary. Wide
+        // names have no code page.
+        let name = format!(
+            "Local\\vmm-sys-util-evt-\u{e9}v\u{e9}nement-{}",
+            std::process::id()
+        );
+        let wide = named_object::to_wide_name(&name).unwrap();
+        // SAFETY: `wide` is a valid NUL-terminated wide string.
+        let created = unsafe { CreateEventW(null(), 0, 0, wide.as_ptr()) };
+        assert!(!created.is_null());
+        // SAFETY: just created above, not yet owned elsewhere.
+        let created = unsafe { EventFd::from_raw_handle(created as RawHandle) };
+
+        let opened = EventFd::open(&name, 0).unwrap();
+        created.write(1).unwrap();
+        assert_eq!(opened.read().unwrap(), 1);
     }
 
     #[test]

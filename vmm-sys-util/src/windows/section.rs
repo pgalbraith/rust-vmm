@@ -12,35 +12,35 @@
 //! (`MmapRegion::from_section`); this type only handles creation,
 //! naming, and handle ownership.
 
-use std::ffi::CString;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, RawHandle};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingA, OpenFileMappingA, FILE_MAP_READ, FILE_MAP_WRITE, PAGE_READWRITE,
+    CreateFileMappingW, OpenFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, PAGE_READWRITE,
 };
 
 use crate::windows::named_object;
 
-fn unique_name() -> CString {
+fn unique_name() -> String {
     named_object::unique_name("vmm-sys-util-sec-")
 }
 
 /// Create a pagefile-backed section under `name` with a creator-only DACL,
 /// failing (rather than adopting the impostor) if the name is taken.
-fn create_named_section(name: &CString, size: u64) -> io::Result<HANDLE> {
+fn create_named_section(name: &str, size: u64) -> io::Result<HANDLE> {
     let sa = named_object::creator_only_attributes()?;
-    // SAFETY: `sa` and `name` are valid for the duration of the call; the
+    let wide = named_object::to_wide_name(name)?;
+    // SAFETY: `sa` and `wide` are valid for the duration of the call; the
     // return value is checked.
     let handle = unsafe {
-        CreateFileMappingA(
+        CreateFileMappingW(
             INVALID_HANDLE_VALUE,
             &sa,
             PAGE_READWRITE,
             (size >> 32) as u32,
             size as u32,
-            name.as_ptr().cast(),
+            wide.as_ptr(),
         )
     };
     if handle.is_null() {
@@ -57,7 +57,7 @@ pub struct Section {
     handle: HANDLE,
     /// The object's name; `None` when the section arrived as a bare
     /// handle ([`FromRawHandle`]) and its name is unknown.
-    name: Option<CString>,
+    name: Option<String>,
 }
 
 // SAFETY: a Win32 HANDLE has no thread affinity, and every method takes
@@ -104,25 +104,23 @@ impl Section {
     }
 
     fn open_with_access(name: &str, access: u32) -> io::Result<Section> {
-        let cname = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        // SAFETY: `cname` is a valid NUL-terminated string for the
+        let wide = named_object::to_wide_name(name)?;
+        // SAFETY: `wide` is a valid NUL-terminated wide string for the
         // duration of the call; the return value is checked.
-        let handle = unsafe { OpenFileMappingA(access, 0, cname.as_ptr().cast()) };
+        let handle = unsafe { OpenFileMappingW(access, 0, wide.as_ptr()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
         Ok(Section {
             handle,
-            name: Some(cname),
+            name: Some(name.to_string()),
         })
     }
 
     /// The object's name, for transmitting to a peer; `None` when the
     /// section arrived as a bare handle and the name is unknown.
     pub fn name(&self) -> Option<&str> {
-        // The name was built from (or validated as) a Rust string, so
-        // it converts back losslessly.
-        self.name.as_ref().and_then(|n| n.to_str().ok())
+        self.name.as_deref()
     }
 }
 
@@ -191,7 +189,7 @@ mod tests {
     fn a_created_section_carries_its_name() {
         let s = Section::new(0x1000).unwrap();
         let name = s.name().expect("a created section must know its name");
-        assert!(name.starts_with("vmm-sys-util-sec-"));
+        assert!(name.starts_with("Local\\vmm-sys-util-sec-"));
     }
 
     #[test]

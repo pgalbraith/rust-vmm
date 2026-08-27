@@ -10,7 +10,7 @@ use std::ptr::null;
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingA, MapViewOfFile, UnmapViewOfFile, VirtualAlloc, VirtualFree,
+    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, VirtualAlloc, VirtualFree,
     FILE_MAP_ALL_ACCESS, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MEM_COMMIT,
     MEM_RELEASE, PAGE_READWRITE,
 };
@@ -95,7 +95,7 @@ impl<B: NewBitmap> MmapRegion<B> {
         }
 
         let mapping = unsafe {
-            CreateFileMappingA(
+            CreateFileMappingW(
                 handle,
                 null(),
                 PAGE_READWRITE,
@@ -455,7 +455,7 @@ mod tests {
         // Windows vhost-user transport.
         assert!(drops_cleanly(MEM_MAPPED, || {
             let section = unsafe {
-                super::CreateFileMappingA(
+                super::CreateFileMappingW(
                     INVALID_HANDLE_VALUE,
                     std::ptr::null(),
                     super::PAGE_READWRITE,
@@ -514,7 +514,7 @@ mod tests {
         // exact equality: other test threads map and unmap concurrently.
         const N: usize = 1000;
         let section = unsafe {
-            super::CreateFileMappingA(
+            super::CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 std::ptr::null(),
                 super::PAGE_READWRITE,

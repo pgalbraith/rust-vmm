@@ -677,9 +677,9 @@ mod tests {
     fn registering_a_manual_reset_event_is_caught_in_debug_builds() {
         // The module's core precondition, enforced at ctl() time: a
         // manual-reset event under a persistent wait would hot-spin.
-        use windows_sys::Win32::System::Threading::CreateEventA;
+        use windows_sys::Win32::System::Threading::CreateEventW;
         // SAFETY: plain create; checked before use.
-        let manual = unsafe { CreateEventA(std::ptr::null(), 1, 0, std::ptr::null()) };
+        let manual = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         assert!(!manual.is_null());
         let epoll = Epoll::new().unwrap();
         let _ = epoll.ctl(
@@ -697,19 +697,18 @@ mod tests {
         // ACCESS_DENIED, and the guard must refuse to pass that through —
         // otherwise it is inert on exactly the peer-opened production path.
         use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
-        use windows_sys::Win32::System::Threading::{CreateEventA, OpenEventA, EVENT_MODIFY_STATE};
-        let name = std::ffi::CString::new(format!(
-            "vmm-sys-util-epoll-query-test-{}",
+        use windows_sys::Win32::System::Threading::{CreateEventW, OpenEventW, EVENT_MODIFY_STATE};
+        let name = crate::windows::named_object::to_wide_name(&format!(
+            "Local\\vmm-sys-util-epoll-query-test-{}",
             std::process::id()
         ))
         .unwrap();
         // SAFETY: valid name; checked before use. Auto-reset, so only the
         // rights — not the mode — can trip the guard.
-        let created = unsafe { CreateEventA(std::ptr::null(), 0, 0, name.as_ptr().cast()) };
+        let created = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
         assert!(!created.is_null());
         // SAFETY: reopening the event just created, with a restricted mask.
-        let narrow =
-            unsafe { OpenEventA(EVENT_MODIFY_STATE | SYNCHRONIZE, 0, name.as_ptr().cast()) };
+        let narrow = unsafe { OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, 0, name.as_ptr()) };
         assert!(!narrow.is_null());
 
         let epoll = Epoll::new().unwrap();
@@ -727,17 +726,17 @@ mod tests {
         // event (contract violation), this side opens it by name with
         // EventFd::open — whose mask includes EVENT_QUERY_STATE precisely
         // so this guard can see the mode — and registration must panic.
-        use windows_sys::Win32::System::Threading::CreateEventA;
-        let name = std::ffi::CString::new(format!(
-            "vmm-sys-util-epoll-manual-test-{}",
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        let name = format!(
+            "Local\\vmm-sys-util-epoll-manual-test-{}",
             std::process::id()
-        ))
-        .unwrap();
+        );
+        let wide = crate::windows::named_object::to_wide_name(&name).unwrap();
         // SAFETY: valid name; checked before use. Manual-reset on purpose.
-        let created = unsafe { CreateEventA(std::ptr::null(), 1, 0, name.as_ptr().cast()) };
+        let created = unsafe { CreateEventW(std::ptr::null(), 1, 0, wide.as_ptr()) };
         assert!(!created.is_null());
 
-        let opened = EventFd::open(name.to_str().unwrap(), 0).unwrap();
+        let opened = EventFd::open(&name, 0).unwrap();
         let epoll = Epoll::new().unwrap();
         let _ = epoll.ctl(
             ControlOperation::Add,

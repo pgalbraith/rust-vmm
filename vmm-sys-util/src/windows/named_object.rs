@@ -15,7 +15,7 @@
 //! the object namespace; a peer that must not be trusted with the namespace
 //! should receive a duplicated handle instead.
 
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::io;
 use std::mem::size_of;
@@ -34,22 +34,41 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-/// Mint an unguessable object name: `prefix` followed by 128 bits from the
-/// OS CSPRNG as hex.
-pub(crate) fn unique_name(prefix: &str) -> CString {
+/// Mint an unguessable object name: an explicit `Local\` (session-local)
+/// namespace prefix, then `prefix`, then 128 bits from the OS CSPRNG as
+/// hex.
+///
+/// The namespace is written out rather than left implicit so the intent
+/// survives review — with one caveat that can't be fixed from here: for a
+/// process in session 0 (a service), `Local\` resolves to the machine's
+/// global `BaseNamedObjects`, so it is a session boundary only when
+/// there's a session to bound.
+pub(crate) fn unique_name(prefix: &str) -> String {
     let mut bytes = [0u8; 16];
     // SAFETY: `bytes` is a valid out-buffer of the stated length.
     // ProcessPrng is documented to always succeed.
     let ok = unsafe { ProcessPrng(bytes.as_mut_ptr(), bytes.len()) };
     assert_ne!(ok, 0, "ProcessPrng failed");
-    let mut name = String::with_capacity(prefix.len() + 32);
+    let mut name = String::with_capacity(6 + prefix.len() + 32);
+    name.push_str("Local\\");
     name.push_str(prefix);
     for b in bytes {
         // Infallible: writing hex into a String.
         write!(name, "{b:02x}").unwrap();
     }
-    // The prefix is ASCII and the hex digits can't introduce a NUL.
-    CString::new(name).unwrap()
+    name
+}
+
+/// Encode `name` as a NUL-terminated wide string for the `W` entry points
+/// — the native forms; the `A` variants convert through the process ANSI
+/// code page, which is machine-configurable, so a non-ASCII name could
+/// resolve differently on each side of a process boundary. Rejects
+/// interior NULs, which would silently truncate the name.
+pub(crate) fn to_wide_name(name: &str) -> io::Result<Vec<u16>> {
+    if name.contains('\0') {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    Ok(name.encode_utf16().chain(std::iter::once(0)).collect())
 }
 
 /// Fail a `Create*` call that actually opened a pre-existing object.
@@ -200,12 +219,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn minted_names_are_long_and_distinct() {
-        let a = unique_name("t-").into_string().unwrap();
-        let b = unique_name("t-").into_string().unwrap();
+    fn minted_names_are_long_distinct_and_session_local() {
+        let a = unique_name("t-");
+        let b = unique_name("t-");
         assert_ne!(a, b);
-        // prefix + 32 hex chars of 128 random bits.
-        assert_eq!(a.len(), 2 + 32);
+        // Explicit namespace + prefix + 32 hex chars of 128 random bits.
+        assert!(a.starts_with("Local\\t-"));
+        assert_eq!(a.len(), 6 + 2 + 32);
+    }
+
+    #[test]
+    fn a_name_with_an_interior_nul_is_refused() {
+        assert!(to_wide_name("bad name").is_err());
+        assert_eq!(to_wide_name("fine").unwrap().last(), Some(&0));
     }
 
     #[test]
