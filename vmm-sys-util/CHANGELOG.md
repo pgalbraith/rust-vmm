@@ -49,6 +49,12 @@
   already consumed by the wait that reported readiness, and even a
   zero-timeout wait here could eat the next signal before `Epoll`
   delivers it.
+- Windows `Epoll` completions are keyed by a monotonically increasing
+  token instead of the registration's heap address: an address could be
+  reused by a later registration, letting a completion queued for a
+  since-deleted registration be delivered with the wrong data (ABA).
+  Tokens are never reused, and resolving them is a map lookup rather
+  than the previous linear scan of the interest list.
 - Windows `EventFd::open` takes a `flag` argument (`EFD_NONBLOCK`
   honored, matching `new`); a peer-opened event was previously always
   blocking, so it could not be polled without hanging.

@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::io;
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use std::ffi::c_void;
@@ -125,6 +126,12 @@ impl EpollEvent {
 }
 
 struct Registration {
+    /// This registration's completion key: monotonically increasing and
+    /// never reused, so a completion queued for a since-deleted
+    /// registration can never alias a newer one — unlike the context
+    /// pointer previously used as the key, which the allocator was free
+    /// to hand right back to the next `add`.
+    token: usize,
     /// The persistent threadpool wait for this handle; freed by
     /// `UnregisterWaitEx` in `unregister`.
     wait_handle: HANDLE,
@@ -134,7 +141,16 @@ struct Registration {
 struct WaitCallbackCtx {
     iocp: HANDLE,
     handle: HANDLE,
-    data: u64,
+    token: usize,
+}
+
+/// The interest list, under one lock: `by_handle` for `ctl`, and the
+/// token-keyed view `data_by_token` for `wait` to resolve completions
+/// with a lookup instead of a scan.
+#[derive(Default)]
+struct Registrations {
+    by_handle: HashMap<HANDLE, Registration>,
+    data_by_token: HashMap<usize, u64>,
 }
 
 // SAFETY: only ever invoked by the Win32 threadpool with the context pointer
@@ -150,7 +166,7 @@ unsafe extern "system" fn wait_callback(param: *mut c_void, _timer_or_wait_fired
     let ctx = unsafe { &*(param as *const WaitCallbackCtx) };
 
     // SAFETY: `ctx.iocp` is valid for as long as this registration is.
-    let posted = unsafe { PostQueuedCompletionStatus(ctx.iocp, 0, param as usize, null_mut()) };
+    let posted = unsafe { PostQueuedCompletionStatus(ctx.iocp, 0, ctx.token, null_mut()) };
     if posted == 0 {
         // The wake-up couldn't be queued, but the signal was already
         // consumed by the wait. For a transient failure (realistically:
@@ -174,7 +190,8 @@ unsafe extern "system" fn wait_callback(param: *mut c_void, _timer_or_wait_fired
 /// feature set.
 pub struct Epoll {
     iocp: HANDLE,
-    registrations: Mutex<HashMap<HANDLE, Registration>>,
+    registrations: Mutex<Registrations>,
+    next_token: AtomicUsize,
 }
 
 impl std::fmt::Debug for Epoll {
@@ -222,7 +239,8 @@ impl Epoll {
         }
         Ok(Epoll {
             iocp,
-            registrations: Mutex::new(HashMap::new()),
+            registrations: Mutex::new(Registrations::default()),
+            next_token: AtomicUsize::new(0),
         })
     }
 
@@ -258,14 +276,15 @@ impl Epoll {
     fn add(&self, handle: HANDLE, event: EpollEvent) -> io::Result<()> {
         debug_assert_auto_reset(handle);
         let mut registrations = self.registrations.lock().unwrap();
-        if registrations.contains_key(&handle) {
+        if registrations.by_handle.contains_key(&handle) {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists));
         }
 
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let ctx = Box::into_raw(Box::new(WaitCallbackCtx {
             iocp: self.iocp,
             handle,
-            data: event.data(),
+            token,
         }));
 
         let mut wait_handle: HANDLE = null_mut();
@@ -292,15 +311,27 @@ impl Epoll {
             return Err(io::Error::last_os_error());
         }
 
-        registrations.insert(handle, Registration { wait_handle, ctx });
+        registrations.by_handle.insert(
+            handle,
+            Registration {
+                token,
+                wait_handle,
+                ctx,
+            },
+        );
+        registrations.data_by_token.insert(token, event.data());
         Ok(())
     }
 
     fn delete(&self, handle: HANDLE) -> io::Result<()> {
         let mut registrations = self.registrations.lock().unwrap();
         let reg = registrations
+            .by_handle
             .remove(&handle)
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        // A completion for this token may still be queued; `wait` skips
+        // keys with no map entry, and the token is never minted again.
+        registrations.data_by_token.remove(&reg.token);
         unregister(reg)
     }
 
@@ -351,19 +382,16 @@ impl Epoll {
                 return Err(err);
             }
 
-            // The key is the registration's context pointer (see wait_callback). A miss means
-            // the registration was deleted after the completion was queued; don't report it.
+            // The key is the registration's token (see wait_callback). A
+            // miss means the registration was deleted after the completion
+            // was queued; don't report it. Tokens are never reused, so a
+            // stale key can't alias a registration added since.
             let registrations = self.registrations.lock().unwrap();
-            let Some(reg) = registrations
-                .values()
-                .find(|reg| reg.ctx as usize == completion_key)
-            else {
+            let Some(&data) = registrations.data_by_token.get(&completion_key) else {
                 drop(registrations);
                 wait_ms = 0;
                 continue;
             };
-            // SAFETY: the registration is in the map, so `ctx` is alive.
-            let data = unsafe { (*reg.ctx).data };
             drop(registrations);
 
             events[count] = EpollEvent::new(EventSet::IN, data);
@@ -387,11 +415,12 @@ impl AsRawHandle for Epoll {
 impl Drop for Epoll {
     fn drop(&mut self) {
         let mut registrations = self.registrations.lock().unwrap();
-        for (_, reg) in registrations.drain() {
+        for (_, reg) in registrations.by_handle.drain() {
             // Can't act on errors in a `Drop` impl; leak on failure rather
             // than panic.
             let _ = unregister(reg);
         }
+        registrations.data_by_token.clear();
         // SAFETY: `self.iocp` is owned by this `Epoll`.
         unsafe {
             CloseHandle(self.iocp);
@@ -763,6 +792,52 @@ mod tests {
             .ctl(
                 ControlOperation::Delete,
                 narrow as RawHandle,
+                EpollEvent::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_stale_completion_key_is_skipped_not_misdelivered() {
+        // Simulates the queued-completion-for-a-deleted-registration case
+        // deterministically: post a key no live registration owns straight
+        // to the port. wait() must skip it and still deliver the real
+        // event — and since tokens are never reused, a stale key can't
+        // alias a registration added later (the ABA the pointer key had).
+        use windows_sys::Win32::System::IO::PostQueuedCompletionStatus;
+
+        let epoll = Epoll::new().unwrap();
+        let event_fd = EventFd::new(0).unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                event_fd.as_raw_handle(),
+                EpollEvent::new(EventSet::IN, 7),
+            )
+            .unwrap();
+
+        // SAFETY: the epoll's port handle is valid; the key is a token
+        // that was never minted.
+        let posted = unsafe {
+            PostQueuedCompletionStatus(epoll.as_raw_handle() as HANDLE, 0, usize::MAX, null_mut())
+        };
+        assert_ne!(posted, 0);
+        event_fd.write(1).unwrap();
+
+        let mut ready = [EpollEvent::default(); 8];
+        let mut total = 0;
+        while total == 0 {
+            total = epoll.wait(5000, &mut ready[..]).unwrap();
+        }
+        assert_eq!(total, 1);
+        assert_eq!(ready[0].data(), 7);
+        // Nothing further: the stale key produced no event.
+        assert_eq!(epoll.wait(100, &mut ready[..]).unwrap(), 0);
+
+        epoll
+            .ctl(
+                ControlOperation::Delete,
+                event_fd.as_raw_handle(),
                 EpollEvent::default(),
             )
             .unwrap();
