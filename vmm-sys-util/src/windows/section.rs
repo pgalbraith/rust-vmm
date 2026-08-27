@@ -87,13 +87,27 @@ impl Section {
     ///
     /// The handle carries read/write mapping access only — enough for
     /// `MmapRegion::from_section`, and nothing beyond it (no
-    /// `SECTION_EXTEND_SIZE`, no `WRITE_DAC`).
+    /// `SECTION_EXTEND_SIZE`, no `WRITE_DAC`). For memory this side
+    /// should not be able to corrupt, use
+    /// [`open_read_only`](Section::open_read_only) instead.
     pub fn open(name: &str) -> io::Result<Section> {
+        Self::open_with_access(name, FILE_MAP_READ | FILE_MAP_WRITE)
+    }
+
+    /// Open an existing named section for reading only.
+    ///
+    /// The handle cannot map a writable view: least privilege for ROM,
+    /// pflash, and any other region whose consumer must not be able to
+    /// modify it, enforced by the kernel rather than by convention.
+    pub fn open_read_only(name: &str) -> io::Result<Section> {
+        Self::open_with_access(name, FILE_MAP_READ)
+    }
+
+    fn open_with_access(name: &str, access: u32) -> io::Result<Section> {
         let cname = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: `cname` is a valid NUL-terminated string for the
         // duration of the call; the return value is checked.
-        let handle =
-            unsafe { OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, 0, cname.as_ptr().cast()) };
+        let handle = unsafe { OpenFileMappingA(access, 0, cname.as_ptr().cast()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -191,6 +205,30 @@ mod tests {
             unsafe { p.read() }
         });
         assert_eq!(seen, 0xA5);
+    }
+
+    #[test]
+    fn a_read_only_open_reads_but_cannot_map_a_writable_view() {
+        let created = Section::new(0x1000).unwrap();
+        with_view(&created, 0x1000, |p| {
+            // SAFETY: the view is valid for 0x1000 bytes.
+            unsafe { p.write(0x5A) };
+        });
+
+        let ro = Section::open_read_only(created.name().unwrap()).unwrap();
+        // SAFETY: the handle is valid for `ro`'s lifetime; the read view is
+        // unmapped before return.
+        unsafe {
+            let view = MapViewOfFile(ro.as_raw_handle() as HANDLE, FILE_MAP_READ, 0, 0, 0x1000);
+            assert!(!view.Value.is_null());
+            assert_eq!((view.Value as *const u8).read(), 0x5A);
+            UnmapViewOfFile(view);
+
+            // A writable view is refused by the kernel, not by convention:
+            // the handle simply lacks the right.
+            let w = MapViewOfFile(ro.as_raw_handle() as HANDLE, FILE_MAP_WRITE, 0, 0, 0x1000);
+            assert!(w.Value.is_null());
+        }
     }
 
     #[test]

@@ -23,6 +23,10 @@
 - Windows `Section::open` requests read/write mapping access instead of
   `FILE_MAP_ALL_ACCESS`, so a peer-held handle can no longer resize the
   section or rewrite its security descriptor.
+- Windows `Section::open_read_only`: opens a section with read-only
+  mapping access, for regions the consumer must not be able to modify
+  (ROM, pflash) — kernel-enforced, pairing with `vm-memory`'s
+  `MmapRegion::from_section_read_only`.
 
 ### Fixed
 

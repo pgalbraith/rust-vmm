@@ -187,6 +187,32 @@ impl<B: NewBitmap> MmapRegion<B> {
     ///   the system allocation granularity.
     /// * `size` - The size of the memory region in bytes.
     pub fn from_section(section: &impl AsRawHandle, offset: u64, size: usize) -> io::Result<Self> {
+        Self::from_section_with_access(section, offset, size, FILE_MAP_READ | FILE_MAP_WRITE)
+    }
+
+    /// Like [`from_section`](Self::from_section), but maps a read-only view.
+    ///
+    /// For regions the consumer must not be able to modify (ROM, pflash),
+    /// with the kernel enforcing it: a write through the returned region
+    /// faults instead of corrupting shared state. Accordingly, the region
+    /// must only be read through (`Bytes::read()`-style access); writing
+    /// through `VolatileMemory` accessors is a guaranteed access violation.
+    /// Works with a section handle opened read-only (`Section::open_read_only`),
+    /// which cannot map a writable view at all.
+    pub fn from_section_read_only(
+        section: &impl AsRawHandle,
+        offset: u64,
+        size: usize,
+    ) -> io::Result<Self> {
+        Self::from_section_with_access(section, offset, size, FILE_MAP_READ)
+    }
+
+    fn from_section_with_access(
+        section: &impl AsRawHandle,
+        offset: u64,
+        size: usize,
+        access: u32,
+    ) -> io::Result<Self> {
         let handle = section.as_raw_handle();
         if handle == INVALID_HANDLE_VALUE || handle.is_null() {
             return Err(io::Error::from_raw_os_error(libc::EBADF));
@@ -204,18 +230,11 @@ impl<B: NewBitmap> MmapRegion<B> {
         // the section, so an out-of-range request becomes an error below rather than an out-of-bounds
         // view. The section's own size is not queryable before mapping, so this is the bounds check.
         // The section already is the mapping object, so unlike `from_file` there's nothing to create.
-        // Read/write view access only: it's all a guest-memory view needs, and a peer-opened
-        // section handle (`Section::open`) carries exactly that much — requesting
-        // FILE_MAP_ALL_ACCESS against one would fail with access denied.
-        let addr = unsafe {
-            MapViewOfFile(
-                handle,
-                FILE_MAP_READ | FILE_MAP_WRITE,
-                (offset >> 32) as u32,
-                offset as u32,
-                size,
-            )
-        };
+        // `access` is read/write or read-only, never FILE_MAP_ALL_ACCESS: a view needs nothing
+        // more, and a peer-opened section handle (`Section::open`/`open_read_only`) doesn't
+        // carry more — requesting FILE_MAP_ALL_ACCESS against one fails with access denied.
+        let addr =
+            unsafe { MapViewOfFile(handle, access, (offset >> 32) as u32, offset as u32, size) };
         if addr.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -438,6 +457,27 @@ mod tests {
             MmapRegion::from_file(FileOffset::new(file, 0), 0x1_0000).unwrap()
         }));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_read_only_section_region_reads_but_rejects_writable_mapping() {
+        // The production least-privilege shape: a peer opens the section
+        // read-only and can see the data but cannot obtain a writable view.
+        use vmm_sys_util::section::Section;
+
+        let section = Section::new(0x1_0000).unwrap();
+        let rw = MmapRegion::from_section(&section, 0, 0x1_0000).unwrap();
+        // SAFETY: the mapping is valid for 0x1_0000 bytes.
+        unsafe { rw.as_ptr().write(0xA5) };
+
+        let ro_handle = Section::open_read_only(section.name().unwrap()).unwrap();
+        // A writable mapping of the read-only handle is refused by the
+        // kernel — the enforcement, not just the convention.
+        assert!(MmapRegion::from_section(&ro_handle, 0, 0x1_0000).is_err());
+
+        let ro = MmapRegion::from_section_read_only(&ro_handle, 0, 0x1_0000).unwrap();
+        // SAFETY: the mapping is valid for 0x1_0000 bytes and only read.
+        assert_eq!(unsafe { ro.as_ptr().cast_const().read() }, 0xA5);
     }
 
     #[test]

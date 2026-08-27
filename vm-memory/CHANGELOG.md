@@ -8,6 +8,10 @@
 - Windows `MmapRegion::from_section` maps its view with read/write access
   instead of `FILE_MAP_ALL_ACCESS`, matching the least-access section
   handles `vmm-sys-util`'s `Section::open` now returns.
+- Windows `MmapRegion::from_section_read_only`: maps a read-only view of
+  a section, making read-only guest regions (ROM, pflash)
+  kernel-enforced rather than conventional; pairs with `vmm-sys-util`'s
+  `Section::open_read_only`.
 
 ### Fixed
 
