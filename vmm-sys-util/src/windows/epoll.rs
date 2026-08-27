@@ -190,7 +190,17 @@ unsafe impl Send for Epoll {}
 // through the `Mutex` or through Win32 APIs that are themselves thread-safe.
 unsafe impl Sync for Epoll {}
 
-fn validate_event_set(events: EventSet) -> io::Result<()> {
+/// Validates the raw bits of a caller-supplied [`EpollEvent`] — raw
+/// because `events` is a public field, so it can hold bits no `EventSet`
+/// variant names, and going through [`EpollEvent::event_set`] here would
+/// panic on exactly the input this function exists to reject.
+fn validate_event_set(bits: u32) -> io::Result<()> {
+    let Some(events) = EventSet::from_bits(bits) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown EventSet bits: {bits:#x}"),
+        ));
+    };
     if !events.is_empty() && events != EventSet::IN {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -233,7 +243,7 @@ impl Epoll {
         handle: RawHandle,
         event: EpollEvent,
     ) -> io::Result<()> {
-        validate_event_set(event.event_set())?;
+        validate_event_set(event.events)?;
         let handle = handle as HANDLE;
         match operation {
             ControlOperation::Add => self.add(handle, event),
@@ -542,6 +552,20 @@ mod tests {
     }
 
     #[test]
+    fn ctl_returns_an_error_for_unknown_bits_instead_of_panicking() {
+        // `events` is a public u32, so callers can hand ctl() bits no
+        // EventSet variant names; that used to panic inside validation.
+        let epoll = Epoll::new().unwrap();
+        let event_fd = EventFd::new(0).unwrap();
+        let mut event = EpollEvent::new(EventSet::IN, 0);
+        event.events = 1 << 30;
+        let err = epoll
+            .ctl(ControlOperation::Add, event_fd.as_raw_handle(), event)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn test_ctl_rejects_unsupported_events() {
         let epoll = Epoll::new().unwrap();
         let event_fd = EventFd::new(0).unwrap();
@@ -684,7 +708,7 @@ mod tests {
         let created = unsafe { CreateEventA(std::ptr::null(), 1, 0, name.as_ptr().cast()) };
         assert!(!created.is_null());
 
-        let opened = EventFd::open(name.to_str().unwrap()).unwrap();
+        let opened = EventFd::open(name.to_str().unwrap(), 0).unwrap();
         let epoll = Epoll::new().unwrap();
         let _ = epoll.ctl(
             ControlOperation::Add,

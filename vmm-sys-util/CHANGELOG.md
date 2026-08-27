@@ -49,6 +49,12 @@
   already consumed by the wait that reported readiness, and even a
   zero-timeout wait here could eat the next signal before `Epoll`
   delivers it.
+- Windows `EventFd::open` takes a `flag` argument (`EFD_NONBLOCK`
+  honored, matching `new`); a peer-opened event was previously always
+  blocking, so it could not be polled without hanging.
+- Windows `Epoll::ctl` returns `InvalidInput` for `EpollEvent` bits no
+  `EventSet` variant names, instead of panicking inside validation —
+  `events` is a public `u32`, so such bits are caller-reachable.
 - Windows `EventFd::into_raw_handle` and `Section::into_raw_handle`
   leaked the object's retained name on every call: `mem::forget`
   suppressed the name's drop along with the handle's. Guarded by new

@@ -75,8 +75,8 @@ fn create_named_event(name: &CString) -> io::Result<HANDLE> {
     named_object::reject_preexisting(handle)
 }
 
-/// A safe wrapper around a named, manual-reset Win32 event object, used as
-/// the Windows analog of Linux `eventfd`.
+/// A safe wrapper around an auto-reset Win32 event object, used as the
+/// Windows analog of Linux `eventfd`.
 #[derive(Debug)]
 pub struct EventFd {
     event: HANDLE,
@@ -94,7 +94,7 @@ unsafe impl Sync for EventFd {}
 
 impl EventFd {
     /// Create a new anonymous `EventFd`, backed by a freshly created
-    /// manual-reset event object.
+    /// auto-reset event object.
     ///
     /// # Arguments
     ///
@@ -157,7 +157,10 @@ impl EventFd {
     ///
     /// * `name`: the name the creating process minted; must not contain an
     ///   interior NUL byte.
-    pub fn open(name: &str) -> result::Result<EventFd, io::Error> {
+    /// * `flag`: only [`EFD_NONBLOCK`] has any effect, same as
+    ///   [`new`](EventFd::new) — non-blocking is a property of this side's
+    ///   handle use, not of who created the object.
+    pub fn open(name: &str, flag: i32) -> result::Result<EventFd, io::Error> {
         // Not exposed outside windows-sys's Wdk tree; the value is fixed.
         const EVENT_QUERY_STATE: u32 = 0x0001;
         let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -174,7 +177,7 @@ impl EventFd {
         }
         Ok(EventFd {
             event: handle,
-            nonblock: false,
+            nonblock: flag & EFD_NONBLOCK != 0,
             name: Some(name),
         })
     }
@@ -277,6 +280,9 @@ impl AsRawHandle for EventFd {
 }
 
 impl FromRawHandle for EventFd {
+    /// The adopted `EventFd` is blocking: unlike a Unix fd's
+    /// `O_NONBLOCK`, a Win32 handle carries no non-blocking mode to
+    /// inherit, so a bare handle can't say how it was meant to be used.
     unsafe fn from_raw_handle(handle: RawHandle) -> Self {
         EventFd {
             event: handle as HANDLE,
@@ -378,14 +384,14 @@ mod tests {
         // SAFETY: handle was just created successfully above.
         let created = unsafe { EventFd::from_raw_handle(handle as RawHandle) };
 
-        let opened = EventFd::open(&name).unwrap();
+        let opened = EventFd::open(&name, 0).unwrap();
         created.write(1).unwrap();
         assert_eq!(opened.read().unwrap(), 1);
     }
 
     #[test]
     fn test_open_missing() {
-        assert!(EventFd::open("vmm-sys-util-evt-does-not-exist").is_err());
+        assert!(EventFd::open("vmm-sys-util-evt-does-not-exist", 0).is_err());
     }
 
     #[test]
@@ -396,7 +402,7 @@ mod tests {
         let name = evt.name().expect("a shareable EventFd must know its name");
         assert!(name.starts_with("vmm-sys-util-evt-"));
 
-        let opened = EventFd::open(name).unwrap();
+        let opened = EventFd::open(name, 0).unwrap();
         evt.write(1).unwrap();
         assert_eq!(opened.read().unwrap(), 1);
     }
@@ -412,6 +418,19 @@ mod tests {
 
         let err = create_named_event(&squatter).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_peer_opened_eventfd_can_be_nonblocking() {
+        // Regression: open() used to hardcode blocking, so a peer-opened
+        // doorbell could not be polled without hanging.
+        let evt = EventFd::new_shareable(0).unwrap();
+        let opened = EventFd::open(evt.name().unwrap(), EFD_NONBLOCK).unwrap();
+        // Unsignaled: must return WouldBlock immediately, not hang.
+        assert_eq!(opened.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        // And still delivers a real signal.
+        evt.write(1).unwrap();
+        assert_eq!(opened.read().unwrap(), 1);
     }
 
     #[test]
@@ -466,7 +485,7 @@ mod tests {
         for _ in 0..N {
             let e = EventFd::new_shareable(0).unwrap();
             let c = e.try_clone().unwrap();
-            let o = EventFd::open(e.name().unwrap()).unwrap();
+            let o = EventFd::open(e.name().unwrap(), 0).unwrap();
             drop((e, c, o));
         }
         let after = crate::windows::process_handle_count();
