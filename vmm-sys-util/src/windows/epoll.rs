@@ -477,12 +477,14 @@ fn debug_assert_auto_reset(handle: HANDLE) {
     // EVENT_QUERY_STATE (the type check precedes the access check, so
     // other waitables fail with STATUS_OBJECT_TYPE_MISMATCH instead).
     // Passing it through silently would leave this guard inert on
-    // peer-opened doorbells — the production path it exists for — so an
-    // unverifiable event is loud too. `EventFd::open` requests the right.
+    // peer-handed doorbells — the production path it exists for — so an
+    // unverifiable event is loud too. A peer duplicating a doorbell in with
+    // DUPLICATE_SAME_ACCESS carries the right along.
     debug_assert!(
         status != STATUS_ACCESS_DENIED,
         "Epoll cannot verify this event's reset mode: the handle lacks \
-         EVENT_QUERY_STATE; open the event with that right included"
+         EVENT_QUERY_STATE; it must be granted when the handle is created \
+         or duplicated"
     );
     // Any other failed query means the handle is some other waitable
     // (semaphore, process, ...), which is allowed; only a confirmed
@@ -695,21 +697,34 @@ mod tests {
         // Empirically pins the NtQueryEvent access requirement (it's
         // undocumented): without EVENT_QUERY_STATE the query fails with
         // ACCESS_DENIED, and the guard must refuse to pass that through —
-        // otherwise it is inert on exactly the peer-opened production path.
+        // otherwise it is inert on exactly the peer-handed production path.
+        use windows_sys::Win32::Foundation::{DuplicateHandle, HANDLE};
         use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
-        use windows_sys::Win32::System::Threading::{CreateEventW, OpenEventW, EVENT_MODIFY_STATE};
-        let name = crate::windows::named_object::to_wide_name(&format!(
-            "Local\\vmm-sys-util-epoll-query-test-{}",
-            std::process::id()
-        ))
-        .unwrap();
-        // SAFETY: valid name; checked before use. Auto-reset, so only the
-        // rights — not the mode — can trip the guard.
-        let created = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+        use windows_sys::Win32::System::Threading::{
+            CreateEventW, GetCurrentProcess, EVENT_MODIFY_STATE,
+        };
+        // SAFETY: simple arguments; checked before use. Auto-reset, so only
+        // the rights — not the mode — can trip the guard.
+        let created = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
         assert!(!created.is_null());
-        // SAFETY: reopening the event just created, with a restricted mask.
-        let narrow = unsafe { OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, 0, name.as_ptr()) };
-        assert!(!narrow.is_null());
+        // A peer that narrowed the access it duplicated in. Access masks are
+        // not a boundary between processes, but a peer may still hand over
+        // less than the guard needs.
+        let mut narrow: HANDLE = std::ptr::null_mut();
+        // SAFETY: `created` is live; `narrow` is a valid out-pointer.
+        let ok = unsafe {
+            let process = GetCurrentProcess();
+            DuplicateHandle(
+                process,
+                created,
+                process,
+                &mut narrow,
+                EVENT_MODIFY_STATE | SYNCHRONIZE,
+                0,
+                0,
+            )
+        };
+        assert!(ok != 0);
 
         let epoll = Epoll::new().unwrap();
         let _ = epoll.ctl(
@@ -723,20 +738,33 @@ mod tests {
     #[should_panic(expected = "auto-reset")]
     fn a_peer_opened_manual_reset_event_is_caught_in_debug_builds() {
         // The end-to-end production shape: a peer mints a manual-reset
-        // event (contract violation), this side opens it by name with
-        // EventFd::open — whose mask includes EVENT_QUERY_STATE precisely
-        // so this guard can see the mode — and registration must panic.
-        use windows_sys::Win32::System::Threading::CreateEventW;
-        let name = format!(
-            "Local\\vmm-sys-util-epoll-manual-test-{}",
-            std::process::id()
-        );
-        let wide = crate::windows::named_object::to_wide_name(&name).unwrap();
-        // SAFETY: valid name; checked before use. Manual-reset on purpose.
-        let created = unsafe { CreateEventW(std::ptr::null(), 1, 0, wide.as_ptr()) };
+        // event (contract violation) and duplicates it in; this side adopts
+        // the handle and registration must panic rather than wait on an
+        // event whose signal it cannot consume.
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
+        use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess};
+        // SAFETY: simple arguments; checked before use. Manual-reset on purpose.
+        let created = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         assert!(!created.is_null());
 
-        let opened = EventFd::open(&name, 0).unwrap();
+        let mut dup: HANDLE = std::ptr::null_mut();
+        // SAFETY: `created` is live; `dup` is a valid out-pointer.
+        let ok = unsafe {
+            let process = GetCurrentProcess();
+            DuplicateHandle(
+                process,
+                created,
+                process,
+                &mut dup,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        assert!(ok != 0);
+        // SAFETY: `dup` was just created and is owned by nothing else.
+        let opened = unsafe { EventFd::from_raw_handle(dup as RawHandle) };
         let epoll = Epoll::new().unwrap();
         let _ = epoll.ctl(
             ControlOperation::Add,

@@ -144,7 +144,7 @@ impl<B: NewBitmap> MmapRegion<B> {
     /// than a file to create one from — `from_file` calls `CreateFileMappingA`, which fails with
     /// `ERROR_INVALID_HANDLE` on a section handle. Needed when memory is shared between processes
     /// with no file involved, e.g. the Windows vhost-user transport, where guest memory arrives as
-    /// the name of a pagefile-backed section, opened with `OpenFileMappingA`.
+    /// a handle to a pagefile-backed section, duplicated in by the peer that owns it.
     ///
     /// # Arguments
     /// * `section` - An open section object. Ownership stays with the caller; the mapping remains
@@ -164,8 +164,8 @@ impl<B: NewBitmap> MmapRegion<B> {
     /// faults instead of corrupting shared state. Accordingly, the region
     /// must only be read through (`Bytes::read()`-style access); writing
     /// through `VolatileMemory` accessors is a guaranteed access violation.
-    /// Works with a section handle opened read-only (`Section::open_read_only`),
-    /// which cannot map a writable view at all.
+    /// Also works with a handle narrowed to `FILE_MAP_READ`, which cannot
+    /// map a writable view at all.
     pub fn from_section_read_only(
         section: &impl AsRawHandle,
         offset: u64,
@@ -198,8 +198,8 @@ impl<B: NewBitmap> MmapRegion<B> {
         // view. The section's own size is not queryable before mapping, so this is the bounds check.
         // The section already is the mapping object, so unlike `from_file` there's nothing to create.
         // `access` is read/write or read-only, never FILE_MAP_ALL_ACCESS: a view needs nothing
-        // more, and a peer-opened section handle (`Section::open`/`open_read_only`) doesn't
-        // carry more — requesting FILE_MAP_ALL_ACCESS against one fails with access denied.
+        // more, and a handle a peer duplicated in may carry no more than that — requesting
+        // FILE_MAP_ALL_ACCESS against such a handle fails with access denied.
         let view =
             unsafe { MapViewOfFile(handle, access, (offset >> 32) as u32, offset as u32, size) };
         if view.Value.is_null() {
@@ -430,17 +430,42 @@ mod tests {
 
     #[test]
     fn a_read_only_section_region_reads_but_rejects_writable_mapping() {
-        // The production least-privilege shape: a peer opens the section
-        // read-only and can see the data but cannot obtain a writable view.
+        // A peer handed a handle narrowed to FILE_MAP_READ can see the data
+        // but cannot map a writable view of it. Note this constrains a
+        // cooperating peer, not a hostile one: DuplicateHandle performs no
+        // access check, so a peer can re-duplicate its own handle for more.
+        // Enforcement against a hostile peer would need the section itself
+        // created with read-only page protection.
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
         use vmm_sys_util::section::Section;
+        use windows_sys::Win32::Foundation::{DuplicateHandle, HANDLE};
+        use windows_sys::Win32::System::Memory::FILE_MAP_READ;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
         let section = Section::new(0x1_0000).unwrap();
         let rw = MmapRegion::from_section(&section, 0, 0x1_0000).unwrap();
         // SAFETY: the mapping is valid for 0x1_0000 bytes.
         unsafe { rw.as_ptr().write(0xA5) };
 
-        let ro_handle = Section::open_read_only(section.name().unwrap()).unwrap();
-        // A writable mapping of the read-only handle is refused by the
+        let mut narrow: HANDLE = std::ptr::null_mut();
+        // SAFETY: the section handle is live; `narrow` is a valid out-pointer.
+        let ok = unsafe {
+            let process = GetCurrentProcess();
+            DuplicateHandle(
+                process,
+                section.as_raw_handle() as HANDLE,
+                process,
+                &mut narrow,
+                FILE_MAP_READ,
+                0,
+                0,
+            )
+        };
+        assert!(ok != 0);
+        // SAFETY: `narrow` was just created and is owned by nothing else.
+        let ro_handle = unsafe { Section::from_raw_handle(narrow as RawHandle) };
+
+        // A writable mapping through the narrowed handle is refused by the
         // kernel — the enforcement, not just the convention.
         assert!(MmapRegion::from_section(&ro_handle, 0, 0x1_0000).is_err());
 

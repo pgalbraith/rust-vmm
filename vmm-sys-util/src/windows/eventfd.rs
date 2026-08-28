@@ -18,16 +18,13 @@
 //! on ([`EventFd::read`], or registration with [`crate::epoll::Epoll`])
 //! must be created auto-reset by its minting process; an event this side
 //! only ever signals ([`EventFd::write`]) works either way — `SetEvent`
-//! is mode-agnostic. A creator cannot *prove* it got auto-reset —
-//! `CreateEventW` over an existing name silently ignores `bManualReset`
-//! and returns the existing object — which is why creation here fails on
-//! `ERROR_ALREADY_EXISTS` instead of proceeding with an object whose
-//! semantics someone else chose.
+//! is mode-agnostic.
 //!
-//! [`EventFd::new`] creates an anonymous event. [`EventFd::new_shareable`]
-//! mints an unguessable name instead, for a peer to open via
-//! [`EventFd::open`] once it's passed out of band — a Win32 object can only
-//! be named at creation, and most events never cross a process boundary.
+//! Every event created here is anonymous. An event that has to cross a
+//! process boundary is not shared by name: the owning process duplicates
+//! its handle into the peer with `DuplicateHandle`, and the peer adopts
+//! the result with [`FromRawHandle`]. An unnamed object is reachable only
+//! by a process that was deliberately handed a handle to it.
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, RawHandle};
@@ -38,13 +35,9 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
     WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE,
-    INFINITE,
+    CreateEventW, GetCurrentProcess, SetEvent, WaitForSingleObject, INFINITE,
 };
-
-use crate::windows::named_object;
 
 // Reexported for #[cfg]-free callers. Only EFD_NONBLOCK has any effect;
 // EFD_SEMAPHORE/EFD_CLOEXEC have no Win32 equivalent and are ignored.
@@ -55,35 +48,12 @@ pub const EFD_CLOEXEC: i32 = 1 << 1;
 /// Mirrors Linux's `EFD_SEMAPHORE`; no effect on Windows (no counter).
 pub const EFD_SEMAPHORE: i32 = 1 << 2;
 
-fn unique_name() -> String {
-    named_object::unique_name("vmm-sys-util-evt-")
-}
-
-/// Create an auto-reset event under `name` with a creator-only DACL,
-/// failing (rather than adopting the impostor) if the name is taken.
-fn create_named_event(name: &str) -> io::Result<HANDLE> {
-    let sa = named_object::creator_only_attributes()?;
-    let wide = named_object::to_wide_name(name)?;
-    // SAFETY: `sa` and `wide` are valid for the duration of the call; the
-    // return value is checked.
-    let handle = unsafe { CreateEventW(&sa, 0, 0, wide.as_ptr()) };
-    if handle.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    // Nothing between the create and this check can clobber the
-    // thread's last-error slot.
-    named_object::reject_preexisting(handle)
-}
-
 /// A safe wrapper around an auto-reset Win32 event object, used as the
 /// Windows analog of Linux `eventfd`.
 #[derive(Debug)]
 pub struct EventFd {
     event: HANDLE,
     nonblock: bool,
-    /// The object's name; `None` when the event arrived as a bare handle
-    /// ([`FromRawHandle`]) and its name is unknown.
-    name: Option<String>,
 }
 
 // SAFETY: a Win32 HANDLE has no thread affinity.
@@ -95,6 +65,9 @@ unsafe impl Sync for EventFd {}
 impl EventFd {
     /// Create a new anonymous `EventFd`, backed by a freshly created
     /// auto-reset event object.
+    ///
+    /// To hand the event to another process, duplicate its handle into
+    /// that process; see the module docs.
     ///
     /// # Arguments
     ///
@@ -109,74 +82,6 @@ impl EventFd {
         Ok(EventFd {
             event: handle,
             nonblock: flag & EFD_NONBLOCK != 0,
-            name: None,
-        })
-    }
-
-    /// Create a new `EventFd` under a freshly minted, unguessable name, for
-    /// handing to another process (see the module docs).
-    ///
-    /// The name is 128 random bits, the object's DACL admits only the
-    /// creating user, and creation fails if the name is somehow already
-    /// taken instead of silently adopting the existing object.
-    ///
-    /// # Arguments
-    ///
-    /// * `flag`: only [`EFD_NONBLOCK`] has any effect; see the module docs.
-    pub fn new_shareable(flag: i32) -> result::Result<EventFd, io::Error> {
-        let name = unique_name();
-        let handle = create_named_event(&name)?;
-        Ok(EventFd {
-            event: handle,
-            nonblock: flag & EFD_NONBLOCK != 0,
-            name: Some(name),
-        })
-    }
-
-    /// The object's name, for transmitting to a peer that will
-    /// [`open`](EventFd::open) the same event; `Some` only for events
-    /// from [`new_shareable`](EventFd::new_shareable) or
-    /// [`open`](EventFd::open) — an anonymous or bare-handle event has
-    /// none to give.
-    pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
-    }
-
-    /// Open an existing named event object created by a peer process (e.g.
-    /// via [`EventFd::new_shareable`] there, with the name communicated out
-    /// of band).
-    ///
-    /// The handle asks for signal, wait, and state-query access — the last
-    /// so that [`crate::epoll::Epoll`]'s debug-build check can verify the
-    /// event is auto-reset (see the module docs); a creator restricting
-    /// its DACL below `EVENT_QUERY_STATE` breaks that verification.
-    ///
-    /// # Arguments
-    ///
-    /// * `name`: the name the creating process minted; must not contain an
-    ///   interior NUL byte.
-    /// * `flag`: only [`EFD_NONBLOCK`] has any effect, same as
-    ///   [`new`](EventFd::new) — non-blocking is a property of this side's
-    ///   handle use, not of who created the object.
-    pub fn open(name: &str, flag: i32) -> result::Result<EventFd, io::Error> {
-        // Not exposed outside windows-sys's Wdk tree; the value is fixed.
-        const EVENT_QUERY_STATE: u32 = 0x0001;
-        let wide = named_object::to_wide_name(name)?;
-        // SAFETY: `wide` is a valid NUL-terminated wide string outliving the call.
-        let handle = unsafe {
-            OpenEventW(
-                EVENT_MODIFY_STATE | EVENT_QUERY_STATE | SYNCHRONIZE,
-                0,
-                wide.as_ptr(),
-            )
-        };
-        if handle.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(EventFd {
-            event: handle,
-            nonblock: flag & EFD_NONBLOCK != 0,
-            name: Some(name.to_string()),
         })
     }
 
@@ -264,9 +169,6 @@ impl EventFd {
         Ok(EventFd {
             event: new_handle,
             nonblock: self.nonblock,
-            // The duplicate refers to the same kernel object, so the
-            // object's name is unchanged.
-            name: self.name.clone(),
         })
     }
 }
@@ -285,18 +187,15 @@ impl FromRawHandle for EventFd {
         EventFd {
             event: handle as HANDLE,
             nonblock: false,
-            name: None,
         }
     }
 }
 
 impl IntoRawHandle for EventFd {
     fn into_raw_handle(self) -> RawHandle {
-        // Suppress `Drop` (which would close the handle) without leaking
-        // the rest of the struct: a bare `mem::forget` also leaked the
-        // name's heap allocation, once per call.
-        let mut this = std::mem::ManuallyDrop::new(self);
-        drop(this.name.take());
+        // Suppress `Drop`, which would close the handle the caller is
+        // taking ownership of. Nothing else in the struct owns memory.
+        let this = std::mem::ManuallyDrop::new(self);
         this.event as RawHandle
     }
 }
@@ -366,128 +265,51 @@ mod tests {
         assert_eq!(evt_clone.read().unwrap(), 1);
     }
 
-    #[test]
-    fn test_open_by_name() {
-        let name = unique_name();
-        let wide = named_object::to_wide_name(&name).unwrap();
-        // SAFETY: `wide` is a valid NUL-terminated wide string.
-        let handle = unsafe { CreateEventW(null(), 0, 0, wide.as_ptr()) };
-        assert!(!handle.is_null());
-        // SAFETY: handle was just created successfully above.
-        let created = unsafe { EventFd::from_raw_handle(handle as RawHandle) };
-
-        let opened = EventFd::open(&name, 0).unwrap();
-        created.write(1).unwrap();
-        assert_eq!(opened.read().unwrap(), 1);
+    /// Stand in for a peer receiving this event: duplicate the handle the
+    /// way an owning process hands one over, and adopt the result.
+    fn duplicate_to_peer(evt: &EventFd) -> EventFd {
+        let mut dup: HANDLE = null_mut();
+        // SAFETY: both process handles are the current-process pseudo
+        // handle, `evt` is live, and `dup` is a valid out-pointer.
+        let ok = unsafe {
+            let process = GetCurrentProcess();
+            DuplicateHandle(
+                process,
+                evt.as_raw_handle() as HANDLE,
+                process,
+                &mut dup,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        assert!(ok != 0, "{}", io::Error::last_os_error());
+        // SAFETY: `dup` was just created and is owned by nothing else.
+        unsafe { EventFd::from_raw_handle(dup as RawHandle) }
     }
 
     #[test]
-    fn test_open_missing() {
-        assert!(EventFd::open("vmm-sys-util-evt-does-not-exist", 0).is_err());
-    }
-
-    #[test]
-    fn a_shareable_eventfd_carries_its_name_for_a_peer_to_open() {
-        // The frontend side of a transport creates the event and sends
-        // its name; without retention nothing could be transmitted.
-        let evt = EventFd::new_shareable(0).unwrap();
-        let name = evt.name().expect("a shareable EventFd must know its name");
-        assert!(name.starts_with("Local\\vmm-sys-util-evt-"));
-
-        let opened = EventFd::open(name, 0).unwrap();
-        evt.write(1).unwrap();
-        assert_eq!(opened.read().unwrap(), 1);
-    }
-
-    #[test]
-    fn creating_over_a_squatted_name_fails_instead_of_adopting_it() {
-        // Windows reports a name collision as success + ERROR_ALREADY_EXISTS,
-        // returning the squatter's object. The create path must refuse it.
-        let squatter = unique_name();
-        let first = create_named_event(&squatter).unwrap();
-        // SAFETY: `first` was just created successfully above.
-        let _first = unsafe { EventFd::from_raw_handle(first as RawHandle) };
-
-        let err = create_named_event(&squatter).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
-    }
-
-    #[test]
-    fn a_non_ascii_name_round_trips() {
-        // The point of the W entry points: the A variants convert names
-        // through the process ANSI code page, so a name outside it could
-        // resolve differently on each side of the process boundary. Wide
-        // names have no code page.
-        let name = format!(
-            "Local\\vmm-sys-util-evt-\u{e9}v\u{e9}nement-{}",
-            std::process::id()
-        );
-        let wide = named_object::to_wide_name(&name).unwrap();
-        // SAFETY: `wide` is a valid NUL-terminated wide string.
-        let created = unsafe { CreateEventW(null(), 0, 0, wide.as_ptr()) };
-        assert!(!created.is_null());
-        // SAFETY: just created above, not yet owned elsewhere.
-        let created = unsafe { EventFd::from_raw_handle(created as RawHandle) };
-
-        let opened = EventFd::open(&name, 0).unwrap();
-        created.write(1).unwrap();
-        assert_eq!(opened.read().unwrap(), 1);
-    }
-
-    #[test]
-    fn a_peer_opened_eventfd_can_be_nonblocking() {
-        // Regression: open() used to hardcode blocking, so a peer-opened
-        // doorbell could not be polled without hanging.
-        let evt = EventFd::new_shareable(0).unwrap();
-        let opened = EventFd::open(evt.name().unwrap(), EFD_NONBLOCK).unwrap();
-        // Unsignaled: must return WouldBlock immediately, not hang.
-        assert_eq!(opened.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
-        // And still delivers a real signal.
-        evt.write(1).unwrap();
-        assert_eq!(opened.read().unwrap(), 1);
-    }
-
-    #[test]
-    fn a_plain_eventfd_is_anonymous() {
-        // Most events never cross a process boundary; they should not
-        // occupy the session's object namespace.
+    fn a_duplicated_eventfd_is_the_same_event() {
+        // How an event crosses a process boundary now: the owner
+        // duplicates its handle in, and signals reach the peer's copy.
         let evt = EventFd::new(0).unwrap();
-        assert!(evt.name().is_none());
+        let peer = duplicate_to_peer(&evt);
+
+        evt.write(1).unwrap();
+        assert_eq!(peer.read().unwrap(), 1);
     }
 
     #[test]
-    fn a_clone_keeps_the_name_and_a_bare_handle_loses_it() {
-        let evt = EventFd::new_shareable(0).unwrap();
-        let cloned = evt.try_clone().unwrap();
-        assert_eq!(cloned.name(), evt.name());
+    fn an_adopted_eventfd_can_be_polled() {
+        // Regression: a doorbell adopted from a peer must be pollable
+        // without hanging when unsignaled.
+        let evt = EventFd::new(0).unwrap();
+        let mut peer = duplicate_to_peer(&evt);
+        peer.nonblock = true;
 
-        // SAFETY: the handle comes straight from into_raw_handle.
-        let adopted = unsafe { EventFd::from_raw_handle(cloned.into_raw_handle()) };
-        assert!(adopted.name().is_none());
-    }
-
-    #[test]
-    fn a_thousand_into_raw_handle_cycles_leak_no_name_bytes() {
-        // The handle-count tests can't see this leak: mem::forget in
-        // into_raw_handle leaked the name's CString — memory, not a
-        // handle. ~50 leaked bytes per cycle over N cycles is a clear
-        // signal; the threshold leaves slack for other tests' allocation
-        // noise in the same window.
-        const N: isize = 2000;
-        let before = crate::windows::allocated_bytes();
-        for _ in 0..N {
-            let e = EventFd::new_shareable(0).unwrap();
-            let h = e.into_raw_handle();
-            // SAFETY: `h` came from into_raw_handle and is closed exactly
-            // once, keeping the handle count flat.
-            unsafe { CloseHandle(h as HANDLE) };
-        }
-        let after = crate::windows::allocated_bytes();
-        assert!(
-            after - before < N * 25,
-            "net allocation grew {} bytes over {N} cycles",
-            after - before
-        );
+        assert_eq!(peer.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        evt.write(1).unwrap();
+        assert_eq!(peer.read().unwrap(), 1);
     }
 
     #[test]
@@ -497,10 +319,28 @@ mod tests {
         const N: u32 = 1000;
         let before = crate::windows::process_handle_count();
         for _ in 0..N {
-            let e = EventFd::new_shareable(0).unwrap();
+            let e = EventFd::new(0).unwrap();
             let c = e.try_clone().unwrap();
-            let o = EventFd::open(e.name().unwrap(), 0).unwrap();
-            drop((e, c, o));
+            let d = duplicate_to_peer(&e);
+            drop((e, c, d));
+        }
+        let after = crate::windows::process_handle_count();
+        assert!(
+            after.saturating_sub(before) < N / 2,
+            "handle count grew from {before} to {after} over {N} cycles"
+        );
+    }
+
+    #[test]
+    fn a_thousand_into_raw_handle_cycles_leak_no_handles() {
+        // into_raw_handle must suppress Drop without closing the handle
+        // it hands over: the caller closes it exactly once.
+        const N: u32 = 1000;
+        let before = crate::windows::process_handle_count();
+        for _ in 0..N {
+            let h = EventFd::new(0).unwrap().into_raw_handle();
+            // SAFETY: `h` came from into_raw_handle and is closed once.
+            unsafe { CloseHandle(h as HANDLE) };
         }
         let after = crate::windows::process_handle_count();
         assert!(
