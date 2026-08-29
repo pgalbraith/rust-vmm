@@ -5,34 +5,25 @@
 ### Added
 
 - [[#254](https://github.com/rust-vmm/vmm-sys-util/pull/254)]: Support `TFD_NONBLOCK` for `timerfd::TimerFd`.
-- Windows support for `eventfd::EventFd`, `epoll::Epoll`, and `event`
-  (`EventConsumer`/`EventNotifier`), bound through `windows-sys`.
-- Windows `section::Section`: a named, pagefile-backed section object,
-  complementing `vm-memory`'s `MmapRegion::from_section`.
-- Windows `EventFd::new_shareable()`: creates the event under a retained
-  name (`EventFd::name()`) for handing to a peer. Plain `EventFd::new()`
-  is anonymous again.
+- Windows support for `eventfd::EventFd`, `epoll::Epoll`, `event`
+  (`EventConsumer`/`EventNotifier`), and `section::Section`, bound
+  through `windows-sys`.
+- Windows `EventFd` and `Section` are always anonymous — there is no
+  API to create or open either under a name. Sharing one with another
+  process means the owner duplicates its handle into that process with
+  `DuplicateHandle`; the peer adopts the result with `FromRawHandle`.
+  An unnamed object is reachable only by a process deliberately handed
+  a handle to it, closing the squatting and same-user-enumeration risk
+  a named scheme would need separate hardening for.
 
-### Security
+### Changed
 
-- Windows named objects (`EventFd::new_shareable`, `Section::new`) now
-  mint their names from 128 CSPRNG bits instead of pid-plus-counter,
-  carry a DACL admitting only the creating user instead of the token's
-  default, and fail on `ERROR_ALREADY_EXISTS` instead of silently
-  adopting a squatter's pre-created object.
-- Windows `Section::open` requests read/write mapping access instead of
-  `FILE_MAP_ALL_ACCESS`, so a peer-held handle can no longer resize the
-  section or rewrite its security descriptor.
-- Windows `Section::open_read_only`: opens a section with read-only
-  mapping access, for regions the consumer must not be able to modify
-  (ROM, pflash) — kernel-enforced, pairing with `vm-memory`'s
-  `MmapRegion::from_section_read_only`.
+- [[#25](https://github.com/rust-vmm/vmm-sys-util/issues/25)]: Mark
+  `linux::aio::IoContext::submit` as unsafe to reflect that callers must uphold
+  the safety requirements for submitted buffers.
 
 ### Fixed
 
-- Windows `Epoll` leaked one threadpool wait handle per delivered event.
-  Re-arming and reaping the spent registration now happens in
-  `Epoll::wait` instead of the callback.
 - Windows `EventFd` is now backed by an auto-reset event instead of
   manual-reset, making consumption atomic in the kernel: one `write`
   wakes exactly one reader (two racing `read`s could previously both
@@ -40,7 +31,7 @@
   own, and a failed completion-port post re-signals the event instead of
   losing the doorbell. The `Epoll` wait registration is persistent now,
   eliminating the per-event unregister/re-register churn. Reset mode is a
-  property of the object and follows the waiter: a peer-minted event this
+  property of the object and follows the waiter: a peer-created event this
   side waits on (kick) must be created auto-reset (`bManualReset =
   FALSE`); events this side only signals (call/err) are mode-agnostic. In
   debug builds, `Epoll::ctl` asserts that a registered event is
@@ -49,13 +40,10 @@
   already consumed by the wait that reported readiness, and even a
   zero-timeout wait here could eat the next signal before `Epoll`
   delivers it.
-- Windows named objects are created and opened through the wide (`W`)
-  entry points instead of the ANSI (`A`) ones, which convert names
-  through the machine-configurable process code page — a non-ASCII
-  name could resolve differently on each side of a process boundary.
-  Names minted by `EventFd::new_shareable` and `Section::new` now
-  carry an explicit `Local\` (session-local) namespace prefix.
-- Windows `Epoll::ctl` `Modify` updates the registration’s data in
+- Windows `Epoll::ctl` returns `InvalidInput` for `EpollEvent` bits no
+  `EventSet` variant names, instead of panicking inside validation —
+  `events` is a public `u32`, so such bits are caller-reachable.
+- Windows `Epoll::ctl` `Modify` updates the registration's data in
   place instead of delete-then-add: retiring the completion token
   dropped any wake-up already queued under it — a consumed kick lost
   in the swap window.
@@ -68,26 +56,6 @@
   since-deleted registration be delivered with the wrong data (ABA).
   Tokens are never reused, and resolving them is a map lookup rather
   than the previous linear scan of the interest list.
-- Windows `EventFd::open` takes a `flag` argument (`EFD_NONBLOCK`
-  honored, matching `new`); a peer-opened event was previously always
-  blocking, so it could not be polled without hanging.
-- Windows `Epoll::ctl` returns `InvalidInput` for `EpollEvent` bits no
-  `EventSet` variant names, instead of panicking inside validation —
-  `events` is a public `u32`, so such bits are caller-reachable.
-- Windows `EventFd::into_raw_handle` and `Section::into_raw_handle`
-  leaked the object's retained name on every call: `mem::forget`
-  suppressed the name's drop along with the handle's. Guarded by new
-  allocation-delta leak tests (the handle-count tests were blind to a
-  memory leak).
-
-### Changed
-
-- [[#25](https://github.com/rust-vmm/vmm-sys-util/issues/25)]: Mark
-  `linux::aio::IoContext::submit` as unsafe to reflect that callers must uphold
-  the safety requirements for submitted buffers.
-
-### Fixed
-
 - Stop importing `libc`/`errno_result` unconditionally in `tempfile.rs`,
   which produced unused-import warnings when building for Windows.
 

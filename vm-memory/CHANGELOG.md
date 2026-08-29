@@ -4,22 +4,24 @@
 
 ### Changed
 
-- Windows bindings now come from `windows-sys` instead of `winapi`.
+- Windows bindings come from `windows-sys` instead of `winapi`,
+  including the mmap module's Win32 calls, which previously used a
+  hand-declared `extern` block. That block typed `MapViewOfFile`'s
+  return and `UnmapViewOfFile`'s argument as a bare pointer where the
+  real ABI uses `MEMORY_MAPPED_VIEW_ADDRESS` — correct on x64 only by
+  coincidence of the calling convention.
 - Windows `MmapRegion::from_file` creates its (unnamed) mapping with
   `CreateFileMappingW`, retiring the last ANSI entry point in the
   crate.
-- The Windows mmap module's Win32 bindings come from `windows-sys`
-  instead of a hand-declared `extern` block whose `MapViewOfFile` /
-  `UnmapViewOfFile` signatures typed the view address as a bare pointer
-  where the real ABI uses `MEMORY_MAPPED_VIEW_ADDRESS` — correct on
-  x64 only by coincidence of the calling convention.
-- Windows `MmapRegion::from_section` maps its view with read/write access
-  instead of `FILE_MAP_ALL_ACCESS`, matching the least-access section
-  handles `vmm-sys-util`'s `Section::open` now returns.
-- Windows `MmapRegion::from_section_read_only`: maps a read-only view of
-  a section, making read-only guest regions (ROM, pflash)
-  kernel-enforced rather than conventional; pairs with `vmm-sys-util`'s
-  `Section::open_read_only`.
+- Windows `MmapRegion::from_section` maps its view with read/write
+  access instead of `FILE_MAP_ALL_ACCESS`: a view never needs more, and
+  a handle a peer duplicated in (`DuplicateHandle`) may carry no more
+  than that — requesting full access against it fails.
+- Windows `MmapRegion::from_section_read_only`: maps a read-only view
+  of a section, making read-only guest regions (ROM, pflash)
+  kernel-enforced rather than conventional. A peer can constrain their
+  own copy of the handle to `FILE_MAP_READ` when duplicating it in, so
+  it cannot map a writable view at all.
 
 ### Fixed
 

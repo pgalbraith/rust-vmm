@@ -21,7 +21,7 @@ bitflags::bitflags! {
     }
 }
 
-/// Signals an event to notify a peer, backed on Windows by a named event object.
+/// Signals an event to notify a peer, backed on Windows by an event object.
 #[derive(Debug)]
 pub struct EventNotifier {
     event: EventFd,
@@ -61,7 +61,7 @@ impl IntoRawHandle for EventNotifier {
     }
 }
 
-/// Consumes a signaled event, backed on Windows by a named event object.
+/// Consumes a signaled event, backed on Windows by an event object.
 #[derive(Debug)]
 pub struct EventConsumer {
     event: EventFd,
