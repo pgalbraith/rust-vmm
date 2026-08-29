@@ -38,7 +38,8 @@ use windows_sys::Win32::System::Threading::{
     RegisterWaitForSingleObject, SetEvent, UnregisterWaitEx, INFINITE, WT_EXECUTEDEFAULT,
 };
 use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus, OVERLAPPED,
+    CreateIoCompletionPort, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus,
+    OVERLAPPED_ENTRY,
 };
 
 bitflags::bitflags! {
@@ -265,10 +266,7 @@ impl Epoll {
         let handle = handle as HANDLE;
         match operation {
             ControlOperation::Add => self.add(handle, event),
-            ControlOperation::Modify => {
-                self.delete(handle)?;
-                self.add(handle, event)
-            }
+            ControlOperation::Modify => self.modify(handle, event),
             ControlOperation::Delete => self.delete(handle),
         }
     }
@@ -323,6 +321,24 @@ impl Epoll {
         Ok(())
     }
 
+    /// Update a registration's user data in place.
+    ///
+    /// Deliberately not delete-then-add: retiring the token would silently
+    /// drop any completion already queued under it — a consumed kick lost
+    /// in the swap window — and there is nothing else to re-register,
+    /// since only [`EventSet::IN`] exists. The wait registration and token
+    /// stay untouched; only the data a future wake-up reports changes.
+    fn modify(&self, handle: HANDLE, event: EpollEvent) -> io::Result<()> {
+        let mut registrations = self.registrations.lock().unwrap();
+        let token = registrations
+            .by_handle
+            .get(&handle)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?
+            .token;
+        registrations.data_by_token.insert(token, event.data());
+        Ok(())
+    }
+
     fn delete(&self, handle: HANDLE) -> io::Result<()> {
         let mut registrations = self.registrations.lock().unwrap();
         let reg = registrations
@@ -353,27 +369,32 @@ impl Epoll {
             timeout as u32
         };
 
+        // Dequeue in batches: one syscall and one lock acquisition cover
+        // many ready doorbells, instead of one of each per completion.
+        const BATCH: usize = 64;
+
         while count < events.len() {
-            let mut bytes_transferred: u32 = 0;
-            let mut completion_key: usize = 0;
-            let mut overlapped: *mut OVERLAPPED = null_mut();
+            let mut entries = [OVERLAPPED_ENTRY::default(); BATCH];
+            let want = (events.len() - count).min(BATCH) as u32;
+            let mut removed: u32 = 0;
             // SAFETY: `self.iocp` is a valid completion port handle for the
-            // lifetime of `self`; the out-parameters are valid for the
-            // duration of the call.
+            // lifetime of `self`; `entries` is valid for `want` writes and
+            // `removed` is a valid out-pointer for the duration of the call.
             let ret = unsafe {
-                GetQueuedCompletionStatus(
+                GetQueuedCompletionStatusEx(
                     self.iocp,
-                    &mut bytes_transferred,
-                    &mut completion_key,
-                    &mut overlapped,
+                    entries.as_mut_ptr(),
+                    want,
+                    &mut removed,
                     wait_ms,
+                    0,
                 )
             };
             if ret == 0 {
                 let err = io::Error::last_os_error();
                 if count > 0 {
-                    // Already found an event; treat a non-blocking
-                    // follow-up miss as "nothing more ready" not an error.
+                    // Already found events; treat a non-blocking follow-up
+                    // miss as "nothing more ready" not an error.
                     break;
                 }
                 if err.raw_os_error() == Some(WAIT_TIMEOUT as i32) {
@@ -382,20 +403,20 @@ impl Epoll {
                 return Err(err);
             }
 
-            // The key is the registration's token (see wait_callback). A
+            // Each key is a registration's token (see wait_callback). A
             // miss means the registration was deleted after the completion
             // was queued; don't report it. Tokens are never reused, so a
-            // stale key can't alias a registration added since.
+            // stale key can't alias a registration added since. The whole
+            // batch resolves under one acquisition of the lock.
             let registrations = self.registrations.lock().unwrap();
-            let Some(&data) = registrations.data_by_token.get(&completion_key) else {
-                drop(registrations);
-                wait_ms = 0;
-                continue;
-            };
+            for entry in &entries[..removed as usize] {
+                if let Some(&data) = registrations.data_by_token.get(&entry.lpCompletionKey) {
+                    events[count] = EpollEvent::new(EventSet::IN, data);
+                    count += 1;
+                }
+            }
             drop(registrations);
 
-            events[count] = EpollEvent::new(EventSet::IN, data);
-            count += 1;
             // Only the first call blocks; the rest drain whatever is
             // already queued, mirroring epoll_wait returning several ready
             // fds from one call.
@@ -906,6 +927,107 @@ mod tests {
                 EpollEvent::default(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn modify_does_not_drop_a_queued_completion() {
+        // Modify used to be delete-then-add, which retired the token: a
+        // kick already consumed and queued under it was silently dropped.
+        // In-place modify keeps the token, so the queued wake-up arrives —
+        // reporting the new data, whichever side of the modify the post
+        // landed on.
+        let epoll = Epoll::new().unwrap();
+        let event_fd = EventFd::new(0).unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                event_fd.as_raw_handle(),
+                EpollEvent::new(EventSet::IN, 7),
+            )
+            .unwrap();
+
+        event_fd.write(1).unwrap();
+        epoll
+            .ctl(
+                ControlOperation::Modify,
+                event_fd.as_raw_handle(),
+                EpollEvent::new(EventSet::IN, 42),
+            )
+            .unwrap();
+
+        let mut ready = [EpollEvent::default(); 8];
+        let mut total = 0;
+        while total == 0 {
+            total = epoll.wait(5000, &mut ready[..]).unwrap();
+        }
+        assert_eq!(total, 1);
+        assert_eq!(ready[0].data(), 42);
+
+        // Modify on an unregistered handle reports NotFound.
+        let stranger = EventFd::new(0).unwrap();
+        let err = epoll
+            .ctl(
+                ControlOperation::Modify,
+                stranger.as_raw_handle(),
+                EpollEvent::new(EventSet::IN, 1),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        epoll
+            .ctl(
+                ControlOperation::Delete,
+                event_fd.as_raw_handle(),
+                EpollEvent::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_batch_of_ready_doorbells_is_delivered_together() {
+        // Exercises the GetQueuedCompletionStatusEx path with many distinct
+        // registrations ready at once: all signals must arrive, each with
+        // its own data, across however many wait calls the timing needs.
+        const N: u64 = 8;
+        let epoll = Epoll::new().unwrap();
+        let fds: Vec<EventFd> = (0..N).map(|_| EventFd::new(0).unwrap()).collect();
+        for (i, fd) in fds.iter().enumerate() {
+            epoll
+                .ctl(
+                    ControlOperation::Add,
+                    fd.as_raw_handle(),
+                    EpollEvent::new(EventSet::IN, i as u64),
+                )
+                .unwrap();
+        }
+        for fd in &fds {
+            fd.write(1).unwrap();
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut ready = [EpollEvent::default(); 16];
+        while seen.len() < N as usize {
+            let n = epoll.wait(5000, &mut ready[..]).unwrap();
+            assert_ne!(n, 0, "doorbell lost: got {} of {N}", seen.len());
+            for ev in &ready[..n] {
+                assert!(
+                    seen.insert(ev.data()),
+                    "duplicate wake-up for {}",
+                    ev.data()
+                );
+            }
+        }
+        assert_eq!(seen, (0..N).collect());
+
+        for fd in &fds {
+            epoll
+                .ctl(
+                    ControlOperation::Delete,
+                    fd.as_raw_handle(),
+                    EpollEvent::default(),
+                )
+                .unwrap();
+        }
     }
 
     #[test]

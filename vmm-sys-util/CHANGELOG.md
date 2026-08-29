@@ -55,6 +55,13 @@
   name could resolve differently on each side of a process boundary.
   Names minted by `EventFd::new_shareable` and `Section::new` now
   carry an explicit `Local\` (session-local) namespace prefix.
+- Windows `Epoll::ctl` `Modify` updates the registration’s data in
+  place instead of delete-then-add: retiring the completion token
+  dropped any wake-up already queued under it — a consumed kick lost
+  in the swap window.
+- Windows `Epoll::wait` dequeues completions in batches
+  (`GetQueuedCompletionStatusEx`): one syscall and one lock
+  acquisition cover many ready doorbells.
 - Windows `Epoll` completions are keyed by a monotonically increasing
   token instead of the registration's heap address: an address could be
   reused by a later registration, letting a completion queued for a
