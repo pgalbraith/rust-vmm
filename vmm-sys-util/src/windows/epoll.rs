@@ -56,6 +56,7 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use std::sync::Mutex;
 
 use std::ffi::c_void;
@@ -681,13 +682,46 @@ impl Epoll {
     /// Wait on the completion port, where both handle signals and socket
     /// readiness arrive.
     fn wait_completions(&self, timeout: i32, events: &mut [EpollEvent]) -> io::Result<usize> {
-        let mut rearm: Vec<SOCKET> = Vec::new();
+        let deadline =
+            (timeout >= 0).then(|| Instant::now() + Duration::from_millis(timeout as u64));
+
+        loop {
+            let remaining = match deadline {
+                None => INFINITE,
+                Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+                    None => 0,
+                    Some(left) => left.as_millis().min(u32::MAX as u128) as u32,
+                },
+            };
+
+            let mut rearm: Vec<SOCKET> = Vec::new();
+            let count = self.drain_completions(remaining, events, &mut rearm)?;
+            // Re-armed after the batch, so a socket that is still ready is
+            // not reported twice by one call.
+            self.rearm_sockets(rearm);
+
+            if count > 0 {
+                return Ok(count);
+            }
+            // Some completions report nothing: a poll cancelled by `ctl` and
+            // re-armed above, or one for a registration removed since. That
+            // is not the caller's wait expiring, so go round again with what
+            // is left of the timeout. Without this a `Modify` swallows the
+            // next wait, and data already waiting on the socket is never
+            // reported.
+            if remaining == 0 {
+                return Ok(0);
+            }
+        }
+    }
+
+    fn drain_completions(
+        &self,
+        mut wait_ms: u32,
+        events: &mut [EpollEvent],
+        rearm: &mut Vec<SOCKET>,
+    ) -> io::Result<usize> {
         let mut count = 0;
-        let mut wait_ms: u32 = if timeout < 0 {
-            INFINITE
-        } else {
-            timeout as u32
-        };
 
         // Dequeue in batches: one syscall and one lock acquisition cover
         // many ready doorbells, instead of one of each per completion.
@@ -718,7 +752,7 @@ impl Epoll {
                     break;
                 }
                 if err.raw_os_error() == Some(WAIT_TIMEOUT as i32) {
-                    return Ok(0);
+                    return Ok(count);
                 }
                 return Err(err);
             }
@@ -758,7 +792,6 @@ impl Epoll {
             wait_ms = 0;
         }
 
-        self.rearm_sockets(rearm);
         Ok(count)
     }
 
@@ -1756,6 +1789,61 @@ mod tests {
         drop(client);
         epoll
             .ctl(ControlOperation::Delete, handle, EpollEvent::default())
+            .unwrap();
+    }
+
+    /// Readability must still be reported after narrowing interest to it.
+    ///
+    /// This is the sequence a device doing its own flow control follows: it
+    /// watches for writability while it has data buffered, and when the
+    /// buffer drains it narrows interest back to readability alone. If the
+    /// narrowing loses the registration, data already waiting is never
+    /// reported and the connection stalls with bytes sitting in it.
+    #[test]
+    fn narrowing_interest_still_reports_data_already_waiting() {
+        let epoll = Epoll::new().unwrap();
+        let (mut client, server) = tcp_pair();
+
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                raw(&server),
+                EpollEvent::new(EventSet::IN | EventSet::OUT, 21),
+            )
+            .unwrap();
+
+        // A fresh socket is writable, so this is what the device sees first.
+        let mut events = [EpollEvent::default(); 4];
+        assert_eq!(epoll.wait(5000, &mut events).unwrap(), 1);
+        assert!(events[0].event_set().contains(EventSet::OUT));
+
+        // The peer sends while the device is still watching for writability.
+        client.write_all(b"echo").unwrap();
+
+        // The device has nothing left to write, so it narrows to readability.
+        epoll
+            .ctl(
+                ControlOperation::Modify,
+                raw(&server),
+                EpollEvent::new(EventSet::IN, 21),
+            )
+            .unwrap();
+
+        // The four bytes are already there and must be reported.
+        assert_eq!(
+            epoll.wait(5000, &mut events).unwrap(),
+            1,
+            "data waiting before the modify was never reported after it"
+        );
+        assert_eq!(events[0].data(), 21);
+        assert!(events[0].event_set().contains(EventSet::IN));
+
+        epoll
+            .ctl(
+                ControlOperation::Delete,
+                raw(&server),
+                EpollEvent::default(),
+            )
             .unwrap();
     }
 
