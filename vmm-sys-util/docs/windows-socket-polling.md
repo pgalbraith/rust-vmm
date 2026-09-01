@@ -29,10 +29,37 @@ directly is the only way to get readiness without also taking ownership of the
 I/O, and it delivers through the IOCP, so sockets and handles arrive in one
 wait.
 
+## What Microsoft says
+
+Not nothing, and not in our favour. There is no supported readiness API on
+Windows because Microsoft has steered developers away from readiness and
+towards completion I/O for twenty years.
+
+- `WSAPoll` was added in Vista as a porting aid for `poll()` code. The Winsock
+  team's own announcement tells anyone building for scale to use "the native
+  Winsock overlapped IO facilities"
+  [https://learn.microsoft.com/en-us/archive/blogs/wndp/wsapoll-a-new-winsock-api-to-simplify-porting-poll-applications-to-winsock]
+  instead. In the comments on the same post a Microsoft engineer says plainly
+  that `select` on Windows exists for compatibility rather than performance.
+- The `WSAPoll` defect above is tracked by Microsoft as "Windows 8 Bugs 309411
+  - WSAPoll does not report failed connections" and was **resolved Won't Fix**,
+  on the grounds of application-compatibility risk and no other customer
+  asking. So the one supported readiness call has a known defect that will not
+  be repaired.
+- AFD itself has never been documented or acknowledged.
+
+CPython shows what following that advice looks like: `asyncio`'s default
+Windows loop is `ProactorEventLoop`, which is IOCP-based and owns the buffers,
+and its `SelectorEventLoop` falls back to `select()`. That route is open to a
+library whose API is completion-shaped to begin with. It is not open here:
+`Epoll` promises callers that it will say when to read, and let them do the
+reading. Trio, whose API makes the same promise with `wait_readable`, ended up
+exactly where this crate does.
+
 ## Who else does this
 
-Four projects, one of them Microsoft's own, all ended up at the same
-undocumented driver, and three of them use the identical `0x00012024`
+Five projects, one of them Microsoft's own, all ended up at the same
+undocumented driver, and four of them use the identical `0x00012024`
 constant. Their sources are the best reference material for writing this.
 
 ### libuv (C) -- github.com/libuv/libuv
@@ -94,6 +121,21 @@ risk is worth knowing. The `select`-based `WindowsSelectorImpl.java` and
 unconditionally, with no property or probe that would fall back to them. The
 JDK today ships AFD as its only default path on Windows.
 
+### Trio (Python) -- github.com/python-trio/trio
+
+Rewrote its Windows backend to use IOCP exclusively, and implements
+`wait_readable` / `wait_writable` on AFD polls completed through it.
+
+- `trio/_core/_io_windows.py` -- the AFD poll submission and completion
+  handling, alongside the rest of the IOCP loop
+- Rationale and history: python-trio/trio issue #52, and the rewrite in
+  pull request #1269
+
+Trio also contributes a constraint the others do not spell out: **the kernel
+misbehaves if more than one `IOCTL_AFD_POLL` is outstanding on the same
+socket**, so a caller wanting both readability and writability has to ask for
+them in a single request.
+
 ### OpenVMM (Rust) -- github.com/microsoft/openvmm
 
 Microsoft's own hypervisor and VMM project. That Microsoft uses AFD in their
@@ -111,7 +153,7 @@ own code is the strongest reason to think it will not be removed.
 Reasons to think this is safe enough:
 
 - **It is load-bearing for the ecosystem.** Node.js (via libuv), Tokio (via
-  mio) and the JDK all depend on it. Breaking `IOCTL_AFD_POLL` would break a
+  mio), Trio and the JDK all depend on it. Breaking `IOCTL_AFD_POLL` would break a
   large fraction of the software Windows runs. That is a compatibility
   constraint on Microsoft in practice, whatever the documentation says.
 - **Microsoft uses it themselves**, in OpenVMM, with no internal API available
@@ -161,18 +203,38 @@ Details that are easy to get wrong, each learned from the implementations above:
 
 ## Status in this fork
 
-**AFD is the agreed design, not the current code.** What is in the tree is a
-level-triggered `WSAPoll` sweep, with a loopback UDP socket used to interrupt
-that sweep when a handle is signalled. `src/windows/epoll.rs` documents how it
-works. It is correct and tested, but it has the `WSAPoll` costs listed above,
-plus one of its own: because a handle signal reaches a waiting caller only
-through that wake socket, `wait` caps how long it blocks and re-checks both
-sources, so that a missed wake cannot hang the caller. Moving to AFD removes
-the sweep, the wake socket and the cap together.
+**Implemented.** `src/windows/afd.rs` opens the driver and issues the polls;
+`src/windows/epoll.rs` registers sockets with it and collects the results on
+the same completion port as the handle signals.
 
-One thing AFD does **not** fix: an `Epoll` still cannot be registered inside
-another `Epoll`, because a completion port is not a waitable object. On Linux
-an epoll fd is pollable and nesting one inside another is routine, so code
-ported from Linux runs into this. Whether to solve it by letting a caller
-associate its sources with an existing completion port, or some other way, is
-a separate question.
+What that removed:
+
+- the `WSAPoll` sweep, which asked about every registered socket on every call
+  whether or not any was ready
+- the loopback wake socket, which existed only to interrupt that sweep
+- the cap on how long `wait` would block, which existed only because a lost
+  wake would otherwise strand the caller forever
+
+Handle signals and socket readiness now arrive by the same route, so there is
+no message between mechanisms to lose. The epoll test suite runs in 0.16s
+against 5.01s before, most of that being the cap.
+
+Notes for anyone changing it:
+
+- The completion identifies its request by the **APC context**, not by the
+  status block, even though this crate passes the same address for both. Get
+  that wrong and every completion comes back with a null pointer and is
+  silently dropped.
+- A socket deleted while its poll is in flight cannot be freed at once: the
+  kernel may still write into the request. It moves to `dying` and is freed
+  when the cancellation completes.
+- `Epoll::drop` closes the AFD handle before freeing anything, which cancels
+  and completes every outstanding poll. wepoll relies on the same ordering.
+
+## Not solved
+
+An `Epoll` still cannot be registered inside another `Epoll`, because a
+completion port is not a waitable object. On Linux an epoll fd is pollable and
+nesting one inside another is routine, so code ported from Linux runs into
+this. Whether to solve it by letting a caller associate its sources with an
+existing completion port, or some other way, is a separate question.

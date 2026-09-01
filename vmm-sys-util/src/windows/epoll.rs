@@ -5,11 +5,12 @@
 //! backed by an I/O completion port and one persistent threadpool wait per
 //! handle.
 //!
-//! Sockets here are polled with `WSAPoll`. The plan is to poll them through
-//! the `\Device\Afd` driver instead, which is what libuv, mio, the JDK and
-//! Microsoft's OpenVMM all do. `docs/windows-socket-polling.md` explains why,
-//! what it costs to depend on an undocumented driver, and where each of those
-//! projects does it.
+//! Sockets are polled through the `\Device\Afd` driver, which is not a
+//! documented or supported Windows interface. There is no supported way to
+//! get level-triggered readiness for sockets and waitable handles from one
+//! wait, and libuv, mio, OpenJDK, Trio and Microsoft's own OpenVMM all reach
+//! the same driver for the same reason. `docs/windows-socket-polling.md`
+//! explains the choice, what it costs, and where each of them does it.
 //!
 //! Two kinds of thing can be registered, and they differ in what they
 //! report.
@@ -41,11 +42,10 @@
 //! would storm: it stays signaled, and the persistent wait would fire
 //! continuously.
 //!
-//! While any socket is registered, [`Epoll::wait`] blocks in `WSAPoll`
-//! rather than on the completion port, so a signalled handle reaches it
-//! over an internal loopback pair created with the first socket. An
-//! `Epoll` that only ever watches handles never creates that pair and
-//! never requires Winsock to have been initialised.
+//! Socket readiness and handle signals both arrive on the completion port,
+//! so [`Epoll::wait`] has one thing to wait on. An `Epoll` that only ever
+//! watches handles never opens the AFD driver and never requires Winsock to
+//! have been initialised.
 //!
 //! A registered handle must be removed with [`ControlOperation::Delete`] (or
 //! by dropping the `Epoll`) before it's closed — unlike Linux, closing first
@@ -53,13 +53,18 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::os::windows::io::{AsRawHandle, IntoRawSocket, RawHandle};
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use std::ffi::c_void;
+use std::os::windows::io::OwnedHandle;
+
+use windows_sys::Win32::Foundation::STATUS_CANCELLED;
+use windows_sys::Win32::System::IO::{CancelIoEx, IO_STATUS_BLOCK};
+
+use super::afd;
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetHandleInformation, GetLastError, ERROR_INVALID_HANDLE, HANDLE,
@@ -73,8 +78,7 @@ use windows_sys::Win32::System::IO::{
     OVERLAPPED_ENTRY,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    closesocket, getsockopt, recv, send, WSAPoll, POLLRDNORM, POLLWRNORM, SOCKET,
-    SOCKET_ERROR, SOL_SOCKET, SO_TYPE, WSAPOLLFD,
+    getsockopt, SOCKET, SOCKET_ERROR, SOL_SOCKET, SO_TYPE,
 };
 
 bitflags::bitflags! {
@@ -182,20 +186,25 @@ struct WaitCallbackCtx {
     iocp: HANDLE,
     handle: HANDLE,
     token: usize,
-    /// Points at the owning `Epoll`'s `wake_writer`. Sound because
-    /// `unregister` blocks until no callback can observe this context
-    /// again, and every registration is unregistered before the `Epoll`
-    /// itself is dropped.
-    wake_writer: *const AtomicIsize,
 }
 
-/// What a registered socket is watched for, and the data to report it
-/// with. Sockets carry no threadpool wait of their own: readiness is
-/// discovered by the sweep in [`Epoll::wait`], and one shared event does
-/// the waking (see `socket_wake`).
+/// What a registered socket is watched for, and the poll outstanding on it.
+///
+/// Exactly one poll is in flight per socket at a time. The kernel misbehaves
+/// when a socket has more than one `IOCTL_AFD_POLL` outstanding, which Trio
+/// documents from its own experience.
 struct SocketRegistration {
+    /// The socket AFD knows about, which is not always the one the caller
+    /// holds: see [`afd::base_socket`].
+    base: SOCKET,
     interest: EventSet,
     data: u64,
+    /// Owned. Freed by whoever removes this registration, once no request is
+    /// in flight against it.
+    state: *mut PollState,
+    /// Set by `modify_socket`: the outstanding poll was cancelled and has to
+    /// be re-issued with the new interest when its completion arrives.
+    rearm: bool,
 }
 
 /// The interest list, under one lock: `by_handle` for `ctl`, and the
@@ -206,6 +215,13 @@ struct Registrations {
     by_handle: HashMap<HANDLE, Registration>,
     data_by_token: HashMap<usize, u64>,
     sockets: HashMap<SOCKET, SocketRegistration>,
+    /// Which socket an AFD completion belongs to, by the address of the
+    /// `IO_STATUS_BLOCK` its poll was issued with.
+    sock_by_iosb: HashMap<usize, SOCKET>,
+    /// Deleted sockets whose poll is still in flight. The kernel may still
+    /// write into these, so they are freed when their completion arrives,
+    /// not when the caller removes them.
+    dying: HashMap<usize, *mut PollState>,
 }
 
 // SAFETY: only ever invoked by the Win32 threadpool with the context pointer
@@ -238,40 +254,25 @@ unsafe extern "system" fn wait_callback(param: *mut c_void, _timer_or_wait_fired
         }
     }
 
-    // While sockets are registered `wait` blocks in `WSAPoll`, not on the
-    // completion port, so the post above would go unnoticed until that poll
-    // returned on its own. One byte on the wake pair is what ends it.
-    // SAFETY: `wake_writer` points at the owning `Epoll`'s field, which
-    // outlives every registration that can reach it.
-    let writer = unsafe { &*ctx.wake_writer }.load(Ordering::Acquire);
-    if writer >= 0 {
-        let byte = 1u8;
-        // SAFETY: the wake pair is closed only after every registration has
-        // been unregistered, which blocks out any in-flight callback.
-        unsafe { send(writer as SOCKET, &byte as *const u8, 1, 0) };
-    }
 }
 
-/// A connected loopback pair used only to interrupt a blocked `WSAPoll`.
+/// Completion key for every AFD poll. Handle registrations use their own
+/// token, counted up from zero by `next_token`, so this cannot collide with
+/// one. Which socket a completion belongs to is found from the address of
+/// the `IO_STATUS_BLOCK` it was issued with, not from the key.
+const AFD_KEY: usize = usize::MAX;
+
+/// One socket's outstanding poll request, kept at a fixed address.
 ///
-/// When sockets are registered, `wait` blocks in `WSAPoll` rather than on
-/// the completion port, because only `WSAPoll` can report socket
-/// readiness without altering the socket -- `WSAEventSelect` would work
-/// too, but it forces the socket into non-blocking mode, and Winsock
-/// offers no way to keep notification and blocking mode together. A
-/// handle signalling while `wait` is blocked writes one byte here, which
-/// is what makes that poll return.
-struct SocketWake {
-    /// Polled alongside the registered sockets, and written by
-    /// `wait_callback` to interrupt that poll. One socket is both ends: a
-    /// datagram socket connected to its own address, so what it sends it
-    /// receives.
-    sock: SOCKET,
+/// The kernel writes into both fields while the request is in flight, so this
+/// is owned through a raw pointer rather than a `Box`: no Rust reference to
+/// it may exist while that is true.
+#[repr(C)]
+struct PollState {
+    iosb: IO_STATUS_BLOCK,
+    info: afd::PollInfo,
 }
 
-/// Completion key for a socket wake-up. It carries no identity: it only
-/// means "sweep the sockets", which is why one event serves all of them.
-/// `next_token` counts up from zero, so this can never collide.
 /// Wrapper over epoll-like functionality, backed by an I/O completion port.
 ///
 /// See the module documentation for what is and is not supported: event
@@ -281,14 +282,10 @@ pub struct Epoll {
     iocp: HANDLE,
     registrations: Mutex<Registrations>,
     next_token: AtomicUsize,
-    /// Created on the first socket registration, not in `new`: making it
-    /// eagerly would require Winsock to be initialized in a process whose
-    /// `Epoll` may only ever watch event handles.
-    socket_wake: Mutex<Option<SocketWake>>,
-    /// The wake pair's writer, or -1 while no socket is registered. Read
-    /// without a lock by `wait_callback`, which must not block behind an
-    /// in-progress `ctl`.
-    wake_writer: AtomicIsize,
+    /// Opened on the first socket registration, not in `new`: an `Epoll`
+    /// that only watches event handles never touches the AFD driver, and
+    /// never needs Winsock started.
+    afd: Mutex<Option<OwnedHandle>>,
 }
 
 impl std::fmt::Debug for Epoll {
@@ -365,38 +362,62 @@ fn is_socket(handle: HANDLE) -> bool {
 }
 
 /// The `WSAPoll` request bits for an interest set.
-fn poll_events(interest: EventSet) -> i16 {
-    let mut events = 0;
+/// What to ask AFD for, given what the caller asked for.
+///
+/// The failure bits go in whatever the caller wanted: a connection that has
+/// died has to reach whoever was waiting on it, in either direction.
+fn afd_events(interest: EventSet) -> u32 {
+    let mut events = afd::POLL_ALWAYS;
     if interest.contains(EventSet::IN) {
-        events |= POLLRDNORM;
+        events |= afd::POLL_RECEIVE
+            | afd::POLL_RECEIVE_EXPEDITED
+            | afd::POLL_ACCEPT
+            | afd::POLL_DISCONNECT;
     }
     if interest.contains(EventSet::OUT) {
-        events |= POLLWRNORM;
+        events |= afd::POLL_SEND | afd::POLL_CONNECT;
     }
     events
 }
 
-/// What to report for a `WSAPoll` result, or `None` if nothing happened.
-///
-/// `POLLERR`/`POLLHUP`/`POLLNVAL` are returned whether or not they were
-/// asked for. They are reported as readability, so the caller's next read
-/// observes the condition and handles it the way it already handles a
-/// closed peer, rather than needing a Windows-specific branch.
-fn event_set_of(revents: i16) -> Option<EventSet> {
-    if revents == 0 {
-        return None;
-    }
+/// What to report, given what AFD said and what the caller asked for.
+fn event_set_of(reported: u32, interest: EventSet) -> EventSet {
+    const READABLE: u32 =
+        afd::POLL_RECEIVE | afd::POLL_RECEIVE_EXPEDITED | afd::POLL_ACCEPT | afd::POLL_DISCONNECT;
+    const WRITABLE: u32 = afd::POLL_SEND | afd::POLL_CONNECT;
+    const FAILED: u32 = afd::POLL_ABORT | afd::POLL_CONNECT_FAIL | afd::POLL_LOCAL_CLOSE;
+
     let mut set = EventSet::empty();
-    if revents & POLLRDNORM != 0 {
+    if reported & READABLE != 0 {
         set |= EventSet::IN;
     }
-    if revents & POLLWRNORM != 0 {
+    if reported & WRITABLE != 0 {
         set |= EventSet::OUT;
     }
-    if set.is_empty() {
-        set = EventSet::IN;
+    set &= interest;
+    if reported & FAILED != 0 {
+        // Report it whichever way the caller was waiting; they find out what
+        // happened from the read or write that follows.
+        set |= interest;
     }
-    Some(set)
+    set
+}
+
+/// Issue the poll for one socket.
+///
+/// Exactly one is outstanding per socket at a time. The kernel misbehaves
+/// with more than one `IOCTL_AFD_POLL` on the same socket, which Trio
+/// documents from its own experience, so readable and writable interest go
+/// in a single request.
+fn arm(afd_handle: HANDLE, reg: &mut SocketRegistration) -> io::Result<()> {
+    // SAFETY: `reg.state` is an allocation this `Epoll` owns and keeps at a
+    // fixed address until no request is outstanding against it. No reference
+    // to it exists while the kernel may be writing.
+    unsafe {
+        (*reg.state).info = afd::PollInfo::new(reg.base as HANDLE, afd_events(reg.interest));
+        afd::poll(afd_handle, &mut (*reg.state).info, &mut (*reg.state).iosb)?;
+    }
+    Ok(())
 }
 
 impl Epoll {
@@ -413,8 +434,7 @@ impl Epoll {
             iocp,
             registrations: Mutex::new(Registrations::default()),
             next_token: AtomicUsize::new(0),
-            socket_wake: Mutex::new(None),
-            wake_writer: AtomicIsize::new(-1),
+            afd: Mutex::new(None),
         })
     }
 
@@ -456,48 +476,72 @@ impl Epoll {
         }
     }
 
-    /// Install the wake pair, once, on the first socket registration.
-    ///
-    /// An `Epoll` that only ever watches event handles never pays for this,
-    /// and never requires Winsock to have been started.
-    fn ensure_wake(&self) -> io::Result<()> {
-        let mut wake = self.socket_wake.lock().unwrap();
-        if wake.is_some() {
-            return Ok(());
+    /// Open the AFD driver, once, on the first socket registration, and
+    /// attach it to this port so its completions arrive in `wait`.
+    fn ensure_afd(&self) -> io::Result<HANDLE> {
+        let mut afd = self.afd.lock().unwrap();
+        if let Some(handle) = afd.as_ref() {
+            return Ok(handle.as_raw_handle() as HANDLE);
         }
-        // Built from `std` rather than raw Winsock calls: `std` performs the
-        // process-wide Winsock start-up that `socket()` would otherwise
-        // require this crate to do, and then never undo.
-        //
-        // One datagram socket, connected to its own address, so that a
-        // `send` with no address arrives at its own `recv`. Connecting a UDP
-        // socket only sets the peer address, so nothing here can block. A TCP
-        // pair would need connect and accept to complete against each other,
-        // which is not something to wait for while registering a socket.
-        let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
-        sock.connect(sock.local_addr()?)?;
-        // Drained from `wait`, which must never block doing it, and written
-        // from a thread-pool callback, which must not block either.
-        sock.set_nonblocking(true)?;
+        let handle = afd::open()?;
+        let raw = handle.as_raw_handle() as HANDLE;
+        // SAFETY: `raw` is an open file object and `self.iocp` a valid port.
+        let port = unsafe { CreateIoCompletionPort(raw, self.iocp, AFD_KEY, 0) };
+        if port.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        *afd = Some(handle);
+        Ok(raw)
+    }
 
-        let sock = sock.into_raw_socket() as SOCKET;
-        // Published last: a callback that observes it must find it usable.
-        self.wake_writer.store(sock as isize, Ordering::Release);
-        *wake = Some(SocketWake { sock });
-        Ok(())
+    /// The AFD handle, if any socket has ever been registered.
+    fn afd_raw(&self) -> Option<HANDLE> {
+        self.afd
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|h| h.as_raw_handle() as HANDLE)
     }
 
     fn add_socket(&self, sock: SOCKET, interest: EventSet, data: u64) -> io::Result<()> {
-        self.ensure_wake()?;
+        let afd_handle = self.ensure_afd()?;
+        let base = afd::base_socket(sock)?;
+
         let mut regs = self.registrations.lock().unwrap();
         if regs.sockets.contains_key(&sock) {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists));
         }
-        regs.sockets.insert(sock, SocketRegistration { interest, data });
+
+        // `iosb` is the first field, so this address is also the address the
+        // completion comes back with.
+        let state = Box::into_raw(Box::new(PollState {
+            // SAFETY: an all-zero IO_STATUS_BLOCK is a valid one.
+            iosb: unsafe { std::mem::zeroed() },
+            info: afd::PollInfo::new(base as HANDLE, 0),
+        }));
+        let key = state as usize;
+
+        let mut reg = SocketRegistration {
+            base,
+            interest,
+            data,
+            state,
+            rearm: false,
+        };
+        if let Err(e) = arm(afd_handle, &mut reg) {
+            // SAFETY: the request was refused, so the kernel never took the
+            // address and nothing can write into it.
+            unsafe { drop(Box::from_raw(state)) };
+            return Err(e);
+        }
+
+        regs.sockets.insert(sock, reg);
+        regs.sock_by_iosb.insert(key, sock);
         Ok(())
     }
 
     fn modify_socket(&self, sock: SOCKET, interest: EventSet, data: u64) -> io::Result<()> {
+        let afd_handle = self.afd_raw();
         let mut regs = self.registrations.lock().unwrap();
         let reg = regs
             .sockets
@@ -505,116 +549,38 @@ impl Epoll {
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         reg.interest = interest;
         reg.data = data;
+
+        // Only one poll may be outstanding per socket, so the one in flight
+        // is cancelled rather than joined by a second. `wait` re-issues it
+        // with the new interest when the cancellation comes back.
+        reg.rearm = true;
+        if let Some(afd_handle) = afd_handle {
+            // SAFETY: `reg.state` addresses the request issued against this
+            // AFD handle; cancelling one that has already completed is
+            // harmless and reports an error that is not worth acting on.
+            unsafe { CancelIoEx(afd_handle, reg.state.cast()) };
+        }
         Ok(())
     }
 
     fn delete_socket(&self, sock: SOCKET) -> io::Result<()> {
+        let afd_handle = self.afd_raw();
         let mut regs = self.registrations.lock().unwrap();
-        regs.sockets
+        let reg = regs
+            .sockets
             .remove(&sock)
-            .map(|_| ())
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
-    }
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let key = reg.state as usize;
+        regs.sock_by_iosb.remove(&key);
 
-    /// Report every registered socket ready at this instant.
-    ///
-    /// Asking rather than remembering is what makes socket readiness
-    /// level-triggered, as epoll is by default. Winsock's own notifications
-    /// are edge-triggered -- `FD_WRITE` in particular re-arms only after a
-    /// send fails -- so a caller that had not exhausted a socket would
-    /// otherwise never hear about it again.
-    fn sweep_sockets(&self, events: &mut [EpollEvent]) -> io::Result<usize> {
-        if events.is_empty() {
-            return Ok(0);
+        if let Some(afd_handle) = afd_handle {
+            // SAFETY: as in `modify_socket`.
+            unsafe { CancelIoEx(afd_handle, reg.state.cast()) };
         }
-        let (mut fds, meta) = {
-            let regs = self.registrations.lock().unwrap();
-            if regs.sockets.is_empty() {
-                return Ok(0);
-            }
-            let mut fds = Vec::with_capacity(regs.sockets.len());
-            let mut meta = Vec::with_capacity(regs.sockets.len());
-            for (sock, reg) in regs.sockets.iter() {
-                fds.push(WSAPOLLFD {
-                    fd: *sock,
-                    events: poll_events(reg.interest),
-                    revents: 0,
-                });
-                meta.push(reg.data);
-            }
-            (fds, meta)
-        };
-
-        // SAFETY: `fds` is valid for `len` elements for the duration of the
-        // call, which returns at once at a zero timeout.
-        let ret = unsafe { WSAPoll(fds.as_mut_ptr(), fds.len() as u32, 0) };
-        if ret == SOCKET_ERROR {
-            return Err(io::Error::last_os_error());
-        }
-
-        let mut count = 0;
-        for (fd, data) in fds.iter().zip(meta) {
-            if count == events.len() {
-                break;
-            }
-            let Some(set) = event_set_of(fd.revents) else {
-                continue;
-            };
-            events[count] = EpollEvent::new(set, data);
-            count += 1;
-        }
-        Ok(count)
-    }
-
-    /// Block until a registered socket is ready or a handle wakes us.
-    ///
-    /// Returns false if `timeout_ms` elapsed with nothing to report.
-    fn poll_block(&self, timeout_ms: i32) -> io::Result<bool> {
-        let (mut fds, wake_reader) = {
-            let wake = self.socket_wake.lock().unwrap();
-            let Some(wake) = wake.as_ref() else {
-                return Ok(false);
-            };
-            let regs = self.registrations.lock().unwrap();
-            let mut fds = Vec::with_capacity(regs.sockets.len() + 1);
-            for (sock, reg) in regs.sockets.iter() {
-                fds.push(WSAPOLLFD {
-                    fd: *sock,
-                    events: poll_events(reg.interest),
-                    revents: 0,
-                });
-            }
-            fds.push(WSAPOLLFD {
-                fd: wake.sock,
-                events: POLLRDNORM,
-                revents: 0,
-            });
-            (fds, wake.sock)
-        };
-
-        // SAFETY: `fds` is valid for `len` elements for the duration.
-        let ret = unsafe { WSAPoll(fds.as_mut_ptr(), fds.len() as u32, timeout_ms) };
-        if ret == SOCKET_ERROR {
-            return Err(io::Error::last_os_error());
-        }
-        if ret == 0 {
-            return Ok(false);
-        }
-
-        // Drain the wake pair if it fired, or it stays readable and every
-        // later poll returns instantly.
-        if fds.last().map(|f| f.revents) != Some(0) {
-            let mut buf = [0u8; 64];
-            loop {
-                // SAFETY: `wake_reader` is owned by this `Epoll` and the
-                // buffer is valid for the call; the socket is non-blocking.
-                let n = unsafe { recv(wake_reader, buf.as_mut_ptr(), buf.len() as i32, 0) };
-                if n <= 0 || (n as usize) < buf.len() {
-                    break;
-                }
-            }
-        }
-        Ok(true)
+        // Not freed here: the kernel may still write into it until the
+        // cancellation completes. `wait` frees it when that arrives.
+        regs.dying.insert(key, reg.state);
+        Ok(())
     }
 
     fn add(&self, handle: HANDLE, event: EpollEvent) -> io::Result<()> {
@@ -630,7 +596,6 @@ impl Epoll {
             iocp: self.iocp,
             handle,
             token,
-            wake_writer: &self.wake_writer as *const AtomicIsize,
         }));
 
         let mut wait_handle: HANDLE = null_mut();
@@ -710,57 +675,13 @@ impl Epoll {
     ///   indefinitely.
     /// * `events` - storage for ready events.
     pub fn wait(&self, timeout: i32, events: &mut [EpollEvent]) -> io::Result<usize> {
-        // With no socket registered this is exactly the completion-port
-        // wait it has always been, at no added cost.
-        if self.registrations.lock().unwrap().sockets.is_empty() {
-            return self.wait_handles(timeout, events);
-        }
-
-        let deadline = (timeout >= 0)
-            .then(|| Instant::now() + Duration::from_millis(timeout as u64));
-
-        loop {
-            // Neither source may block while the other might have work:
-            // sweep the sockets, then take whatever the port already holds.
-            let mut count = self.sweep_sockets(events)?;
-            count += self.wait_handles(0, &mut events[count..])?;
-            if count > 0 {
-                return Ok(count);
-            }
-
-            let remaining = match deadline {
-                None => -1,
-                Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
-                    None => return Ok(0),
-                    Some(left) => left.as_millis().min(i32::MAX as u128) as i32,
-                },
-            };
-            // Blocks in WSAPoll, which a signalled handle interrupts by
-            // writing to the wake socket (see `wait_callback`).
-            //
-            // If that write is ever missed, the caller waits here forever
-            // rather than late. So cap the wait and look at both sources
-            // again, instead of trusting the wake to arrive.
-            //
-            // The cap costs one extra wake-up every RECHECK_MS while a socket
-            // is registered, and nothing at all when none is. It can go when
-            // sockets move to AFD (see `docs/windows-socket-polling.md`):
-            // handle and socket readiness then both arrive on the completion
-            // port, and there is no wake to miss.
-            const RECHECK_MS: i32 = 50;
-            let block_for = if remaining < 0 {
-                RECHECK_MS
-            } else {
-                remaining.min(RECHECK_MS)
-            };
-            if !self.poll_block(block_for)? && remaining >= 0 && remaining <= RECHECK_MS {
-                return Ok(0);
-            }
-        }
+        self.wait_completions(timeout, events)
     }
 
-    /// The completion-port half of [`Epoll::wait`]: event handles only.
-    fn wait_handles(&self, timeout: i32, events: &mut [EpollEvent]) -> io::Result<usize> {
+    /// Wait on the completion port, where both handle signals and socket
+    /// readiness arrive.
+    fn wait_completions(&self, timeout: i32, events: &mut [EpollEvent]) -> io::Result<usize> {
+        let mut rearm: Vec<SOCKET> = Vec::new();
         let mut count = 0;
         let mut wait_ms: u32 = if timeout < 0 {
             INFINITE
@@ -802,19 +723,34 @@ impl Epoll {
                 return Err(err);
             }
 
-            // Each key is a registration's token (see wait_callback). A
-            // miss means the registration was deleted after the completion
-            // was queued; don't report it. Tokens are never reused, so a
-            // stale key can't alias a registration added since. The whole
-            // batch resolves under one acquisition of the lock.
-            let registrations = self.registrations.lock().unwrap();
+            // A handle completion carries its registration's token as the
+            // key (see wait_callback); a socket completion carries AFD_KEY,
+            // and says which socket by the address it was issued with. A
+            // miss in either case means the registration was removed after
+            // the completion was queued; don't report it. Tokens are never
+            // reused, so a stale key cannot alias a newer registration. The
+            // whole batch resolves under one acquisition of the lock.
+            let mut regs = self.registrations.lock().unwrap();
             for entry in &entries[..removed as usize] {
-                if let Some(&data) = registrations.data_by_token.get(&entry.lpCompletionKey) {
+                if entry.lpCompletionKey == AFD_KEY {
+                    if let Some((set, data, sock)) = resolve_afd(&mut regs, entry) {
+                        if !set.is_empty() {
+                            events[count] = EpollEvent::new(set, data);
+                            count += 1;
+                        }
+                        // Re-armed once the batch is done, so a socket that
+                        // is still ready is not reported twice by one call.
+                        rearm.push(sock);
+                    }
+                } else if let Some(&data) = regs.data_by_token.get(&entry.lpCompletionKey) {
                     events[count] = EpollEvent::new(EventSet::IN, data);
                     count += 1;
                 }
+                if count == events.len() {
+                    break;
+                }
             }
-            drop(registrations);
+            drop(regs);
 
             // Only the first call blocks; the rest drain whatever is
             // already queued, mirroring epoll_wait returning several ready
@@ -822,8 +758,73 @@ impl Epoll {
             wait_ms = 0;
         }
 
+        self.rearm_sockets(rearm);
         Ok(count)
     }
+
+    /// Put a fresh poll on every socket that just reported.
+    ///
+    /// This is what makes socket readiness level-triggered: AFD answers once
+    /// and stops, so a socket the caller has not drained is only reported
+    /// again because it is asked again.
+    fn rearm_sockets(&self, sockets: Vec<SOCKET>) {
+        if sockets.is_empty() {
+            return;
+        }
+        let Some(afd_handle) = self.afd_raw() else {
+            return;
+        };
+        let mut regs = self.registrations.lock().unwrap();
+        for sock in sockets {
+            if let Some(reg) = regs.sockets.get_mut(&sock) {
+                // A socket that cannot be re-armed stops being reported.
+                // There is nowhere to return this from `wait`, and the
+                // caller's own next read or write is what will surface it.
+                let _ = arm(afd_handle, reg);
+            }
+        }
+    }
+}
+
+/// Turn one AFD completion into something to report.
+///
+/// `None` means there is nothing to report and nothing to re-arm: the
+/// registration is gone.
+fn resolve_afd(
+    regs: &mut Registrations,
+    entry: &OVERLAPPED_ENTRY,
+) -> Option<(EventSet, u64, SOCKET)> {
+    let key = entry.lpOverlapped as usize;
+
+    if let Some(state) = regs.dying.remove(&key) {
+        // Deleted while this poll was in flight. The completion is the
+        // kernel saying it has finished with the buffer, so free it now.
+        // SAFETY: this pointer came from `Box::into_raw` in `add_socket`,
+        // and no request is outstanding against it any more.
+        unsafe { drop(Box::from_raw(state)) };
+        return None;
+    }
+
+    let sock = *regs.sock_by_iosb.get(&key)?;
+    let reg = regs.sockets.get_mut(&sock)?;
+    // SAFETY: `reg.state` is this `Epoll`'s allocation, and the completion
+    // is the kernel saying it has finished writing into it.
+    let (status, reported) = unsafe {
+        (
+            (*reg.state).iosb.Anonymous.Status,
+            (*reg.state).info.handles[0].events,
+        )
+    };
+
+    if reg.rearm || status == STATUS_CANCELLED {
+        // Cancelled by `modify_socket`, or by a delete that raced this
+        // completion. Nothing happened on the socket; re-arm and say
+        // nothing.
+        reg.rearm = false;
+        return Some((EventSet::empty(), reg.data, sock));
+    }
+
+    Some((event_set_of(reported, reg.interest), reg.data, sock))
 }
 
 impl AsRawHandle for Epoll {
@@ -837,26 +838,31 @@ impl Drop for Epoll {
         // Order matters: `unregister` below blocks out any in-flight
         // callback, and a callback reads `wake_writer`. Stop publishing it
         // first, then close the pair after the waits are gone.
-        self.wake_writer.store(-1, Ordering::Release);
+        // Close the AFD handle first. That cancels and completes every poll
+        // outstanding on it, so afterwards nothing can write into a
+        // `PollState` and they are safe to free. wepoll closes its AFD
+        // handles for the same reason and in the same order.
+        drop(self.afd.lock().unwrap().take());
+
         let mut registrations = self.registrations.lock().unwrap();
+        for (_, reg) in registrations.sockets.drain() {
+            // SAFETY: from `Box::into_raw` in `add_socket`, with no request
+            // outstanding now the driver handle is closed.
+            unsafe { drop(Box::from_raw(reg.state)) };
+        }
+        for (_, state) in registrations.dying.drain() {
+            // SAFETY: as above.
+            unsafe { drop(Box::from_raw(state)) };
+        }
+        registrations.sock_by_iosb.clear();
+
         for (_, reg) in registrations.by_handle.drain() {
             // Can't act on errors in a `Drop` impl; leak on failure rather
             // than panic.
             let _ = unregister(reg);
         }
         registrations.data_by_token.clear();
-        registrations.sockets.clear();
         drop(registrations);
-
-        // Safe to close now: every wait is unregistered, so no callback can
-        // still be holding the writer.
-        if let Some(wake) = self.socket_wake.lock().unwrap().take() {
-            // SAFETY: owned by this `Epoll`; the registered sockets
-            // themselves are the caller's to close.
-            unsafe {
-                closesocket(wake.sock);
-            }
-        }
 
         // SAFETY: `self.iocp` is owned by this `Epoll`.
         unsafe {
@@ -1047,6 +1053,7 @@ fn unregister(reg: Registration) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use crate::event::EventConsumer;
     use crate::eventfd::EventFd;
     use std::io::{Read, Write};

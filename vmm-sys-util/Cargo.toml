@@ -29,9 +29,12 @@ bitflags = "2.13"
 version = "0.61"
 features = [
     "Win32_Foundation",
-    # Socket readiness in `epoll`: WSAPoll for the level-triggered sweep,
-    # and a loopback pair to interrupt it. Not WSAEventSelect, which would
-    # force the caller's socket into non-blocking mode.
+    # Socket readiness in `epoll` comes from the AFD driver: NtOpenFile and
+    # NtDeviceIoControlFile, plus the Winsock ioctls that find the socket AFD
+    # knows about. AFD is undocumented; see docs/windows-socket-polling.md.
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Wdk_System_IO",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Storage_FileSystem",
