@@ -1700,6 +1700,65 @@ mod tests {
         assert_eq!(events[0].data(), 7);
     }
 
+    /// A listener with a connection waiting reports readable.
+    ///
+    /// AFD calls this POLL_ACCEPT, not POLL_RECEIVE, so it is a different
+    /// bit and a different path from a connected socket having data to
+    /// read. It is also the path a device that serves host connections
+    /// depends on from the moment it starts.
+    #[test]
+    fn a_listening_socket_reports_a_pending_connection() {
+        let epoll = Epoll::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = listener.as_raw_socket() as RawHandle;
+
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                handle,
+                EpollEvent::new(EventSet::IN, 11),
+            )
+            .unwrap();
+
+        let mut events = [EpollEvent::default(); 4];
+        assert_eq!(
+            epoll.wait(0, &mut events).unwrap(),
+            0,
+            "nothing is waiting to be accepted yet"
+        );
+
+        let client = TcpStream::connect(addr).unwrap();
+
+        assert_eq!(epoll.wait(5000, &mut events).unwrap(), 1);
+        assert_eq!(events[0].data(), 11);
+        assert!(events[0].event_set().contains(EventSet::IN));
+
+        // Level-triggered: still unaccepted, so still reported.
+        assert_eq!(
+            epoll.wait(5000, &mut events).unwrap(),
+            1,
+            "a connection left unaccepted should go on being reported"
+        );
+
+        let (_accepted, _) = listener.accept().unwrap();
+
+        // One wait may still hand back an answer the driver gave before the
+        // accept, since that answer was already on its way. What matters is
+        // that the next one, asked after the accept, reports nothing.
+        let _ = epoll.wait(0, &mut events);
+        assert_eq!(
+            epoll.wait(0, &mut events).unwrap(),
+            0,
+            "an accepted connection should stop being reported"
+        );
+
+        drop(client);
+        epoll
+            .ctl(ControlOperation::Delete, handle, EpollEvent::default())
+            .unwrap();
+    }
+
     #[test]
     fn a_socket_reports_writability() {
         let epoll = Epoll::new().unwrap();
