@@ -5,6 +5,13 @@
 //! backed by an I/O completion port and one persistent threadpool wait per
 //! handle.
 //!
+//! Sockets are polled here with `WSAPoll`. That is an interim mechanism:
+//! the agreed direction is to poll them through the `\Device\Afd` driver
+//! instead, as libuv, mio, the JDK and Microsoft's own OpenVMM all do. See
+//! `docs/windows-socket-polling.md` for that decision, what it costs --
+//! AFD is undocumented Windows surface -- and where each of those projects
+//! does it.
+//!
 //! Two kinds of thing can be registered, and they differ in what they
 //! report.
 //!

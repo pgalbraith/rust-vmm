@@ -20,6 +20,29 @@ with files, event file descriptors, ioctls and others.
 - Linux
 - Windows (partial support)
 
+## Windows socket polling uses an undocumented interface
+
+`Epoll` on Windows polls sockets through the Windows **AFD driver**
+(`\Device\Afd`, `IOCTL_AFD_POLL`), which is **not a documented or supported
+Windows API**. There is no supported way to get level-triggered readiness for
+sockets and waitable handles from a single wait, so every project that has
+needed `epoll` semantics on Windows has reached the same driver:
+
+| Project | Where |
+| --- | --- |
+| **libuv** | `src/win/poll.c`, `src/win/winsock.c` (`uv_msafd_poll`, `AFD_POLL_INFO`) |
+| **mio** (Tokio) | `src/sys/windows/afd.rs`, `src/sys/windows/selector.rs` |
+| **OpenJDK** 17+ | `.../libnio/ch/wepoll.c` (vendored wepoll) + `sun/nio/ch/WEPoll.java`, `WEPollSelectorImpl.java`, `WEPollPoller.java` -- JDK-8266369 |
+| **OpenVMM** (Microsoft) | `support/pal/src/windows/afd.rs`, `pal_async/src/windows/socket.rs` |
+
+**Status:** AFD is the adopted design, not yet the implementation. The code
+currently polls sockets with an interim `WSAPoll` sweep, which is correct but
+scales in registered sockets rather than ready ones.
+
+See [docs/windows-socket-polling.md](docs/windows-socket-polling.md) for the
+reasoning, the risk, the cross-references above in full, and implementation
+notes.
+
 ## License
 
 This code is licensed under [BSD-3-Clause](LICENSE-BSD-3-Clause).
