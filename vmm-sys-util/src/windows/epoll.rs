@@ -63,7 +63,8 @@ use std::time::{Duration, Instant};
 use std::ffi::c_void;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_INVALID_HANDLE, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    CloseHandle, GetHandleInformation, GetLastError, ERROR_INVALID_HANDLE, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Threading::{
     RegisterWaitForSingleObject, SetEvent, UnregisterWaitEx, INFINITE, WT_EXECUTEDEFAULT,
@@ -862,6 +863,20 @@ impl Drop for Epoll {
 /// `RegisterWaitForSingleObject` does with it.
 fn reject_unwaitable(handle: HANDLE) -> io::Result<()> {
     const OBJECT_TYPE_INFORMATION_CLASS: i32 = 2;
+
+    // A handle that names nothing at all is the other way to reach the
+    // fatal path, and the cheaper one to detect. `GetHandleInformation`
+    // answers without touching the object -- it cannot consume a signal
+    // the way a zero-timeout wait on an auto-reset event would.
+    let mut flags: u32 = 0;
+    // SAFETY: the out-parameter is valid for the call, which tolerates any
+    // handle value including an invalid one.
+    if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a valid handle, so it cannot be registered with an Epoll",
+        ));
+    }
 
     #[link(name = "ntdll")]
     extern "system" {
@@ -1826,5 +1841,25 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn an_invalid_handle_is_refused_rather_than_fatal() {
+        // Registering one does not fail in RegisterWaitForSingleObject; the
+        // process dies in the thread pool afterwards. Callers reach here by
+        // passing a descriptor that names nothing -- a closed one, or the -1
+        // that stands for "no descriptor" on the POSIX side.
+        let epoll = Epoll::new().unwrap();
+
+        for bad in [-1isize, 0isize] {
+            let err = epoll
+                .ctl(
+                    ControlOperation::Add,
+                    bad as RawHandle,
+                    EpollEvent::new(EventSet::IN, 1),
+                )
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "for {bad}");
+        }
     }
 }
