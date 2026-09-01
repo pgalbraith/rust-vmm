@@ -29,8 +29,9 @@ bitflags = "2.13"
 version = "0.61"
 features = [
     "Win32_Foundation",
-    # Socket readiness in `epoll`: WSAEventSelect for the wake-up and
-    # WSAPoll for the level-triggered sweep that reports it.
+    # Socket readiness in `epoll`: WSAPoll for the level-triggered sweep,
+    # and a loopback pair to interrupt it. Not WSAEventSelect, which would
+    # force the caller's socket into non-blocking mode.
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Storage_FileSystem",
