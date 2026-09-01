@@ -263,10 +263,11 @@ unsafe extern "system" fn wait_callback(param: *mut c_void, _timer_or_wait_fired
 /// handle signalling while `wait` is blocked writes one byte here, which
 /// is what makes that poll return.
 struct SocketWake {
-    /// Polled alongside the registered sockets; drained and discarded.
-    reader: SOCKET,
-    /// Written by `wait_callback`; see `Epoll::wake_writer`.
-    writer: SOCKET,
+    /// Polled alongside the registered sockets, and written by
+    /// `wait_callback`; see `Epoll::wake_writer`. One socket serves as both
+    /// ends: it is a datagram socket connected to its own address, so what
+    /// it sends it receives.
+    sock: SOCKET,
 }
 
 /// Completion key for a socket wake-up. It carries no identity: it only
@@ -468,19 +469,23 @@ impl Epoll {
         // Built from `std` rather than raw Winsock calls: `std` performs the
         // process-wide Winsock start-up that `socket()` would otherwise
         // require this crate to do, and then never undo.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let writer = std::net::TcpStream::connect(listener.local_addr()?)?;
-        let (reader, _) = listener.accept()?;
-        // Nagle would sit on a one-byte wake-up.
-        writer.set_nodelay(true)?;
-        // Drained from `wait`, which must never block doing it.
-        reader.set_nonblocking(true)?;
+        //
+        // A datagram socket, connected to the address it is bound to, so that
+        // a `send` with no address arrives at its own `recv`. Connecting a UDP
+        // socket only fixes the peer address -- there is no handshake, and so
+        // nothing here that can block. A TCP pair would need `connect` and
+        // `accept` to complete against each other, which is a poor thing to
+        // depend on inside a registration.
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        sock.connect(sock.local_addr()?)?;
+        // Drained from `wait`, which must never block doing it, and written
+        // from a thread-pool callback, which must not block either.
+        sock.set_nonblocking(true)?;
 
-        let reader = reader.into_raw_socket() as SOCKET;
-        let writer = writer.into_raw_socket() as SOCKET;
-        // Published last: a callback that observes it must find a usable pair.
-        self.wake_writer.store(writer as isize, Ordering::Release);
-        *wake = Some(SocketWake { reader, writer });
+        let sock = sock.into_raw_socket() as SOCKET;
+        // Published last: a callback that observes it must find it usable.
+        self.wake_writer.store(sock as isize, Ordering::Release);
+        *wake = Some(SocketWake { sock });
         Ok(())
     }
 
@@ -582,11 +587,11 @@ impl Epoll {
                 });
             }
             fds.push(WSAPOLLFD {
-                fd: wake.reader,
+                fd: wake.sock,
                 events: POLLRDNORM,
                 revents: 0,
             });
-            (fds, wake.reader)
+            (fds, wake.sock)
         };
 
         // SAFETY: `fds` is valid for `len` elements for the duration.
@@ -733,8 +738,26 @@ impl Epoll {
                 },
             };
             // Blocks in WSAPoll, which a signalled handle interrupts by
-            // writing to the wake pair (see `wait_callback`).
-            if !self.poll_block(remaining)? {
+            // writing to the wake socket (see `wait_callback`).
+            //
+            // That interruption is the only thing connecting a handle signal
+            // to a caller waiting here, and it is a message sent between two
+            // mechanisms that know nothing of each other. Rather than let a
+            // wake that goes astray strand the caller for the rest of an
+            // unbounded wait -- a hang, not a delay -- the block is capped and
+            // the loop re-checks both sources. The cap costs one wake-up per
+            // interval while sockets are registered, and nothing otherwise:
+            // it is a property of polling sockets and handles through two
+            // different primitives, and goes away with the move to AFD
+            // described in `docs/windows-socket-polling.md`, where both
+            // arrive on the same port.
+            const RECHECK_MS: i32 = 50;
+            let block_for = if remaining < 0 {
+                RECHECK_MS
+            } else {
+                remaining.min(RECHECK_MS)
+            };
+            if !self.poll_block(block_for)? && remaining >= 0 && remaining <= RECHECK_MS {
                 return Ok(0);
             }
         }
@@ -832,11 +855,10 @@ impl Drop for Epoll {
         // Safe to close now: every wait is unregistered, so no callback can
         // still be holding the writer.
         if let Some(wake) = self.socket_wake.lock().unwrap().take() {
-            // SAFETY: both halves are owned by this `Epoll`, and the
-            // registered sockets themselves are the caller's to close.
+            // SAFETY: owned by this `Epoll`; the registered sockets
+            // themselves are the caller's to close.
             unsafe {
-                closesocket(wake.reader);
-                closesocket(wake.writer);
+                closesocket(wake.sock);
             }
         }
 
