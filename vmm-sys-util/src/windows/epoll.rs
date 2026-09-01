@@ -5,12 +5,11 @@
 //! backed by an I/O completion port and one persistent threadpool wait per
 //! handle.
 //!
-//! Sockets are polled here with `WSAPoll`. That is an interim mechanism:
-//! the agreed direction is to poll them through the `\Device\Afd` driver
-//! instead, as libuv, mio, the JDK and Microsoft's own OpenVMM all do. See
-//! `docs/windows-socket-polling.md` for that decision, what it costs --
-//! AFD is undocumented Windows surface -- and where each of those projects
-//! does it.
+//! Sockets here are polled with `WSAPoll`. The plan is to poll them through
+//! the `\Device\Afd` driver instead, which is what libuv, mio, the JDK and
+//! Microsoft's OpenVMM all do. `docs/windows-socket-polling.md` explains why,
+//! what it costs to depend on an undocumented driver, and where each of those
+//! projects does it.
 //!
 //! Two kinds of thing can be registered, and they differ in what they
 //! report.
@@ -264,9 +263,9 @@ unsafe extern "system" fn wait_callback(param: *mut c_void, _timer_or_wait_fired
 /// is what makes that poll return.
 struct SocketWake {
     /// Polled alongside the registered sockets, and written by
-    /// `wait_callback`; see `Epoll::wake_writer`. One socket serves as both
-    /// ends: it is a datagram socket connected to its own address, so what
-    /// it sends it receives.
+    /// `wait_callback` to interrupt that poll. One socket is both ends: a
+    /// datagram socket connected to its own address, so what it sends it
+    /// receives.
     sock: SOCKET,
 }
 
@@ -470,12 +469,11 @@ impl Epoll {
         // process-wide Winsock start-up that `socket()` would otherwise
         // require this crate to do, and then never undo.
         //
-        // A datagram socket, connected to the address it is bound to, so that
-        // a `send` with no address arrives at its own `recv`. Connecting a UDP
-        // socket only fixes the peer address -- there is no handshake, and so
-        // nothing here that can block. A TCP pair would need `connect` and
-        // `accept` to complete against each other, which is a poor thing to
-        // depend on inside a registration.
+        // One datagram socket, connected to its own address, so that a
+        // `send` with no address arrives at its own `recv`. Connecting a UDP
+        // socket only sets the peer address, so nothing here can block. A TCP
+        // pair would need connect and accept to complete against each other,
+        // which is not something to wait for while registering a socket.
         let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
         sock.connect(sock.local_addr()?)?;
         // Drained from `wait`, which must never block doing it, and written
@@ -740,17 +738,15 @@ impl Epoll {
             // Blocks in WSAPoll, which a signalled handle interrupts by
             // writing to the wake socket (see `wait_callback`).
             //
-            // That interruption is the only thing connecting a handle signal
-            // to a caller waiting here, and it is a message sent between two
-            // mechanisms that know nothing of each other. Rather than let a
-            // wake that goes astray strand the caller for the rest of an
-            // unbounded wait -- a hang, not a delay -- the block is capped and
-            // the loop re-checks both sources. The cap costs one wake-up per
-            // interval while sockets are registered, and nothing otherwise:
-            // it is a property of polling sockets and handles through two
-            // different primitives, and goes away with the move to AFD
-            // described in `docs/windows-socket-polling.md`, where both
-            // arrive on the same port.
+            // If that write is ever missed, the caller waits here forever
+            // rather than late. So cap the wait and look at both sources
+            // again, instead of trusting the wake to arrive.
+            //
+            // The cap costs one extra wake-up every RECHECK_MS while a socket
+            // is registered, and nothing at all when none is. It can go when
+            // sockets move to AFD (see `docs/windows-socket-polling.md`):
+            // handle and socket readiness then both arrive on the completion
+            // port, and there is no wake to miss.
             const RECHECK_MS: i32 = 50;
             let block_for = if remaining < 0 {
                 RECHECK_MS
@@ -886,10 +882,10 @@ impl Drop for Epoll {
 fn reject_unwaitable(handle: HANDLE) -> io::Result<()> {
     const OBJECT_TYPE_INFORMATION_CLASS: i32 = 2;
 
-    // A handle that names nothing at all is the other way to reach the
-    // fatal path, and the cheaper one to detect. `GetHandleInformation`
-    // answers without touching the object -- it cannot consume a signal
-    // the way a zero-timeout wait on an auto-reset event would.
+    // A handle that names nothing kills the process the same way, and is
+    // cheaper to spot. `GetHandleInformation` answers without touching the
+    // object, so unlike a zero-timeout wait it cannot swallow a signal from
+    // an auto-reset event.
     let mut flags: u32 = 0;
     // SAFETY: the out-parameter is valid for the call, which tolerates any
     // handle value including an invalid one.

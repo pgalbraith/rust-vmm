@@ -35,13 +35,13 @@ needed `epoll` semantics on Windows has reached the same driver:
 | **OpenJDK** 17+ | `.../libnio/ch/wepoll.c` (vendored wepoll) + `sun/nio/ch/WEPoll.java`, `WEPollSelectorImpl.java`, `WEPollPoller.java` -- JDK-8266369 |
 | **OpenVMM** (Microsoft) | `support/pal/src/windows/afd.rs`, `pal_async/src/windows/socket.rs` |
 
-**Status:** AFD is the adopted design, not yet the implementation. The code
-currently polls sockets with an interim `WSAPoll` sweep, which is correct but
-scales in registered sockets rather than ready ones.
+**Status:** AFD is the plan, not the current code. Sockets are polled with
+`WSAPoll` for now. That works, but it gets slower as more sockets are
+registered, whether or not any of them are ready.
 
-See [docs/windows-socket-polling.md](docs/windows-socket-polling.md) for the
-reasoning, the risk, the cross-references above in full, and implementation
-notes.
+[docs/windows-socket-polling.md](docs/windows-socket-polling.md) has the
+reasoning, what the risk is and how to bound it, the full references, and
+notes for anyone implementing it.
 
 ## License
 

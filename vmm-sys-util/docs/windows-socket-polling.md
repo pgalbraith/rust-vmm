@@ -7,22 +7,21 @@ driven by `NtDeviceIoControlFile` with `IOCTL_AFD_POLL` (`0x00012024`), with
 the results collected on the same I/O completion port the rest of `Epoll`
 already uses.
 
-**AFD is not a documented or supported Windows interface.** It appears in no
-SDK header and has no MSDN contract; Microsoft is free to change it. That is
-a real cost, taken with open eyes, and the rest of this document explains why
-it is still the right call and who else has made it.
+**AFD is not a documented or supported Windows interface.** It is in no SDK
+header and has no MSDN page, and Microsoft can change it. The rest of this
+document says why we are doing it anyway, and who else already does.
 
 ## Why the supported APIs do not work
 
-`epoll` promises three things at once: readiness (not completion) notification,
-level-triggered semantics, and a single wait that covers sockets *and* other
-waitable objects. Windows offers no supported way to get all three.
+`epoll` gives you three things at once: readiness notification rather than
+completion, level-triggered behaviour, and one wait that covers sockets *and*
+other waitable objects. No supported Windows API gives all three.
 
 | Supported option | Why it fails here |
 | --- | --- |
-| `select` / `WSAPoll` | O(n) in *registered* sockets on every call, not in ready ones. Cannot wait on a `HANDLE` at the same time, so handle signals need a side channel. `WSAPoll` also does not report a failed non-blocking `connect` -- a long-acknowledged defect. |
+| `select` / `WSAPoll` | O(n) in *registered* sockets on every call, not in ready ones. Cannot wait on a `HANDLE` at the same time, so handle signals need a side channel. `WSAPoll` also fails to report a failed non-blocking `connect`, which Microsoft has acknowledged and not fixed. |
 | `WSAEventSelect` | Edge-triggered (`FD_WRITE` re-arms only after a send fails), and it forces the socket into non-blocking mode. Winsock gives no way to keep event notification and blocking mode together, so registering a socket would silently change its semantics for its owner. |
-| IOCP alone | Completion-based. There is no way to express "tell me when this is readable" without issuing the read yourself and thereby owning the buffer -- which a readiness-based caller cannot do. |
+| IOCP alone | Reports completion, not readiness. To find out that a socket is readable you have to start the read, which means owning the buffer. A caller that just wants to be told when to read cannot do that. |
 | A thread per socket | Scales with sockets rather than with activity, and multiplies the shutdown races. |
 
 AFD is the layer beneath Winsock that all of these are built on. Asking it
@@ -30,11 +29,11 @@ directly is the only way to get readiness without also taking ownership of the
 I/O, and it delivers through the IOCP, so sockets and handles arrive in one
 wait.
 
-## Prior art: everyone with this problem has landed here
+## Who else does this
 
-This is the cross-reference to keep. Four independent projects -- one of them
-Microsoft's own -- reached the same undocumented driver, and three of them
-carry the identical `0x00012024` constant.
+Four projects, one of them Microsoft's own, all ended up at the same
+undocumented driver, and three of them use the identical `0x00012024`
+constant. Their sources are the best reference material for writing this.
 
 ### libuv (C) -- github.com/libuv/libuv
 
@@ -82,14 +81,14 @@ before assuming one wait loop will do:
 
 Two of its choices transfer directly to this crate:
 
-- **`EPOLLONESHOT` there is not an optimisation, it is the grain of the
-  driver.** See the implementation notes below.
+- **`EPOLLONESHOT` is not an optimisation there.** It is how the driver
+  works: see the note on one-shot polls under "Implementation notes".
 - **Its wake-up channel is an `AF_UNIX` pipe**, not a loopback TCP pair:
   `WEPollSelectorImpl` builds a `PipeImpl(sp, /* AF_UNIX */ true, false)` and
   registers one end with wepoll. Windows has had `AF_UNIX` since 1803.
 
-On risk, OpenJDK is the most conservative consumer here and so the most
-informative. The `select`-based `WindowsSelectorImpl.java` and
+OpenJDK is the most cautious project on this list, so what it does about the
+risk is worth knowing. The `select`-based `WindowsSelectorImpl.java` and
 `WindowsSelectorProvider.java` do remain in the tree -- but
 `DefaultSelectorProvider` now returns `new WEPollSelectorProvider()`
 unconditionally, with no property or probe that would fall back to them. The
@@ -97,8 +96,8 @@ JDK today ships AFD as its only default path on Windows.
 
 ### OpenVMM (Rust) -- github.com/microsoft/openvmm
 
-Microsoft's own hypervisor and VMM project, which is the strongest single
-argument that this interface is not going to be withdrawn quietly.
+Microsoft's own hypervisor and VMM project. That Microsoft uses AFD in their
+own code is the strongest reason to think it will not be removed.
 
 - `support/pal/src/windows/afd.rs` -- `open_afd()` via `NtOpenFile`,
   `IOCTL_AFD_POLL = 0x00012024`, `PollInfo` / `PollHandleInfo`, and the full
@@ -109,7 +108,7 @@ argument that this interface is not going to be withdrawn quietly.
 
 ## Living with an undocumented interface
 
-What makes this defensible rather than reckless:
+Reasons to think this is safe enough:
 
 - **It is load-bearing for the ecosystem.** Node.js (via libuv), Tokio (via
   mio) and the JDK all depend on it. Breaking `IOCTL_AFD_POLL` would break a
@@ -141,36 +140,39 @@ Details that are easy to get wrong, each learned from the implementations above:
   re-issued. Level-triggered behaviour is produced by re-arming after each
   completion, not by the driver. Both mio (the `SockState` re-arm loop) and
   OpenJDK (`EPOLLONESHOT` in `WEPollPoller`) are shaped around this.
-- **Resolve the base socket first.** A socket may be layered by an LSP, and the
-  handle the application holds is then not the one AFD knows. Query
-  `SIO_BASE_HANDLE` -- but note mio's hard-won comment that at least one known
-  LSP deliberately breaks it, so `SIO_BSP_HANDLE` is needed as a fallback.
+- **Resolve the base socket first.** A layered service provider (LSP) can sit
+  in front of a socket, and then the handle the application holds is not the
+  one AFD knows about. Query `SIO_BASE_HANDLE` for the real one. mio's comment
+  records that at least one LSP deliberately breaks that query, so
+  `SIO_BSP_HANDLE` is needed as a fallback.
 - **Open `\Device\Afd` with no extended attributes**, via `NtOpenFile`; both
   wepoll and OpenVMM note this explicitly.
-- **The socket is not modified.** This is the point of the exercise: unlike
-  `WSAEventSelect`, polling through AFD leaves blocking mode and every other
-  socket option exactly as the owner set them.
-- **If an internal wake channel is still wanted, `AF_UNIX` beats loopback
-  TCP.** The interim `WSAPoll` path uses a loopback TCP pair; OpenJDK uses an
-  `AF_UNIX` pipe for the same job. Once readiness arrives on the port the pair
-  may not be needed at all, but if one is, `AF_UNIX` avoids leaving a
-  listening TCP socket in the process.
+- **The socket is not modified.** This is the main reason to use AFD at all.
+  Unlike `WSAEventSelect`, polling through AFD leaves blocking mode and every
+  other socket option as the owner set them.
+- **If a wake channel is still needed, prefer `AF_UNIX`.** Once readiness
+  arrives on the completion port there may be nothing to wake, so this may not
+  come up. If it does, OpenJDK uses an `AF_UNIX` pipe. The interim `WSAPoll`
+  path here uses a loopback UDP socket, which works but is still a network
+  socket in the process.
 - **Associate the AFD handle with the existing completion port**, so socket
   readiness and handle signals are collected by one `wait`. That is what lets
   the internal loopback wake pair and the `WSAPoll` sweep go away entirely.
 
 ## Status in this fork
 
-The AFD path described above is the **accepted direction, not yet the
-implementation**. What is in the tree today is the interim mechanism: a
-level-triggered `WSAPoll` sweep with an internal loopback pair to deliver
-handle signals, described in the module documentation of
-`src/windows/epoll.rs`. It is correct and tested, but it carries the `WSAPoll`
-costs listed above.
+**AFD is the agreed design, not the current code.** What is in the tree is a
+level-triggered `WSAPoll` sweep, with a loopback UDP socket used to interrupt
+that sweep when a handle is signalled. `src/windows/epoll.rs` documents how it
+works. It is correct and tested, but it has the `WSAPoll` costs listed above,
+plus one of its own: because a handle signal reaches a waiting caller only
+through that wake socket, `wait` caps how long it blocks and re-checks both
+sources, so that a missed wake cannot hang the caller. Moving to AFD removes
+the sweep, the wake socket and the cap together.
 
-One limitation is worth stating separately, because AFD does **not** by itself
-resolve it: an `Epoll` still cannot be registered inside another `Epoll`, since
-a completion port is not a waitable object. On Linux an epoll fd is pollable
-and nesting is routine, so callers ported from Linux hit this. Whether to
-address it by exposing the completion port for association, or by some other
-means, is an open question independent of this decision.
+One thing AFD does **not** fix: an `Epoll` still cannot be registered inside
+another `Epoll`, because a completion port is not a waitable object. On Linux
+an epoll fd is pollable and nesting one inside another is routine, so code
+ported from Linux runs into this. Whether to solve it by letting a caller
+associate its sources with an existing completion port, or some other way, is
+a separate question.
