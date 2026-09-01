@@ -839,13 +839,6 @@ impl Drop for Epoll {
     }
 }
 
-/// Debug-build guard for the module's core precondition: a manual-reset
-/// event under a persistent wait fires continuously, so catch the
-/// misregistration at `ctl()` time instead of as a mystery hot spin.
-///
-/// `NtQueryEvent` lives in ntdll, which `windows-sys` does not bind; the
-/// hand-declared extern is confined to debug builds.
-#[cfg(debug_assertions)]
 /// Refuse a handle the threadpool cannot wait on.
 ///
 /// Registering one does not fail: `RegisterWaitForSingleObject` accepts it
@@ -919,6 +912,13 @@ fn reject_unwaitable(handle: HANDLE) -> io::Result<()> {
     Ok(())
 }
 
+/// Debug-build guard for the module's core precondition: a manual-reset
+/// event under a persistent wait fires continuously, so catch the
+/// misregistration at `ctl()` time instead of as a mystery hot spin.
+///
+/// `NtQueryEvent` lives in ntdll, which `windows-sys` does not bind; the
+/// hand-declared extern is confined to debug builds.
+#[cfg(debug_assertions)]
 fn debug_assert_auto_reset(handle: HANDLE) {
     const EVENT_BASIC_INFORMATION_CLASS: i32 = 0;
     const SYNCHRONIZATION_EVENT: i32 = 1; // auto-reset; 0 = NotificationEvent
@@ -1173,6 +1173,8 @@ mod tests {
             .is_err());
     }
 
+    // Asserts a `debug_assert!`, which release builds compile out.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "auto-reset")]
     fn registering_a_manual_reset_event_is_caught_in_debug_builds() {
@@ -1190,6 +1192,8 @@ mod tests {
         );
     }
 
+    // Asserts a `debug_assert!`, which release builds compile out.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "EVENT_QUERY_STATE")]
     fn an_event_opened_without_query_rights_is_loud_not_silently_unverified() {
@@ -1233,6 +1237,8 @@ mod tests {
         );
     }
 
+    // Asserts a `debug_assert!`, which release builds compile out.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "auto-reset")]
     fn a_peer_opened_manual_reset_event_is_caught_in_debug_builds() {
