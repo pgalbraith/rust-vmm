@@ -29,6 +29,9 @@ bitflags = "2.13"
 version = "0.61"
 features = [
     "Win32_Foundation",
+    # Socket readiness in `epoll`: WSAEventSelect for the wake-up and
+    # WSAPoll for the level-triggered sweep that reports it.
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
