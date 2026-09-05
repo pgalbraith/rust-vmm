@@ -15,6 +15,10 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 with-serde = ["serde", "serde_derive"]
+# Completion-based I/O (`completion` module). Windows only for now: the
+# module is compiled only on Windows, so a Linux build with the feature on
+# fails at the first use site rather than getting a stub.
+completion = []
 
 [dependencies]
 libc = "0.2.127"
@@ -45,3 +49,9 @@ features = [
 
 [dev-dependencies]
 serde_json = "1.0.9"
+
+# The completion tests keep an operation pending on an overlapped named
+# pipe, which needs CreateNamedPipeW. Nothing outside tests uses it.
+[target.'cfg(target_family = "windows")'.dev-dependencies.windows-sys]
+version = "0.61"
+features = ["Win32_System_Pipes"]

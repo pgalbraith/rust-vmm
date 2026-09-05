@@ -15,6 +15,21 @@
   An unnamed object is reachable only by a process deliberately handed
   a handle to it, closing the squatting and same-user-enumeration risk
   a named scheme would need separate hardening for.
+- Windows: a completion-based I/O API in a new `completion` module,
+  behind the new `completion` cargo feature. `Port` is an I/O completion
+  port that dequeues in batches and accepts posted packets, including
+  from another process through a duplicated port handle. `Operation` is
+  an overlapped block that owns its buffer, and anything it is told to
+  hold, from submission until the completion is dequeued; cancellation
+  is asynchronous and a cancelled operation still completes, with an
+  error; dropping a `Port` cancels and drains what is outstanding before
+  freeing it. `Signal` is `EventFd` under a second name, bridged into
+  the port by a registered wait. `Timer` posts to the port when it
+  expires. Socket submissions (`AcceptEx`, `WSARecv`, `WSASend`) live in
+  `completion::socket`; the rest of the module never links Winsock. The
+  module is exported on Windows only, so enabling the feature on Linux
+  changes nothing there.
+- Windows `EventFd` implements `AsHandle`.
 
 ### Changed
 

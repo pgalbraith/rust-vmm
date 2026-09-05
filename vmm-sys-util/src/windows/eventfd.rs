@@ -27,7 +27,9 @@
 //! by a process that was deliberately handed a handle to it.
 
 use std::io;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, RawHandle};
+use std::os::windows::io::{
+    AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, IntoRawHandle, RawHandle,
+};
 use std::ptr::{null, null_mut};
 use std::result;
 
@@ -176,6 +178,14 @@ impl EventFd {
 impl AsRawHandle for EventFd {
     fn as_raw_handle(&self) -> RawHandle {
         self.event as RawHandle
+    }
+}
+
+impl AsHandle for EventFd {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        // SAFETY: `self.event` is open for as long as `self` is, which is
+        // the lifetime the borrow carries.
+        unsafe { BorrowedHandle::borrow_raw(self.event as RawHandle) }
     }
 }
 
